@@ -1,6 +1,6 @@
 {
   "name": "options-desk",
-  "version": "2.0.0",
+  "version": "4.0.0",
   "private": true,
   "scripts": {
     "sync": "cap sync android"
@@ -9,6 +9,7 @@
     "@capacitor/android": "^6.1.2",
     "@capacitor/cli": "^6.1.2",
     "@capacitor/core": "^6.1.2",
-    "@capacitor/share": "^6.0.3"
+    "@capacitor/share": "^6.0.3",
+    "@capacitor/local-notifications": "^6.1.0"
   }
 }

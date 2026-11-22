@@ -38,8 +38,8 @@
     async closed(sym, tf) {
       const d = await this.get3(`/historical-candle/intraday/${encodeURIComponent(U()[sym].key)}/minutes/${tf}`);
       const now = Date.now();
-      const c = (d.candles || []).find((k) => new Date(k[0]).getTime() + tf * 60000 <= now);
-      return c ? { ts: c[0], close: c[4] } : null;
+      const done = (d.candles || []).filter((k) => new Date(k[0]).getTime() + tf * 60000 <= now);
+      return done.length ? { ts: done[0][0], close: done[0][4], hist: done.slice(0, 8).map((k) => k[4]) } : null;
     }
     async expiries(sym) {
       const d = await this.get('/option/contract', { instrument_key: U()[sym].key });
@@ -73,9 +73,9 @@
     track() {
       const id = QT.candleId(this.tf || 15); this.bk = this.bk || {};
       for (const s of Object.keys(this.spot)) {
-        const b = this.bk[s];
-        if (!b) this.bk[s] = { id, last: this.spot[s], closed: { ts: new Date().toISOString(), close: U()[s].ltp } };
-        else if (b.id !== id) this.bk[s] = { id, last: this.spot[s], closed: { ts: new Date().toISOString(), close: b.last } };
+        const b = this.bk[s], u = U()[s];
+        if (!b) { const h = []; let p = u.ltp; for (let i = 0; i < 6; i++) { h.push(p); p = p * (1 + (this.r() - 0.5) * 0.004); } this.bk[s] = { id, last: this.spot[s], hist: h, closed: { ts: new Date().toISOString(), close: h[0], hist: h } }; }
+        else if (b.id !== id) { b.hist = [b.last, ...b.hist].slice(0, 8); this.bk[s] = { id, last: this.spot[s], hist: b.hist, closed: { ts: new Date().toISOString(), close: b.last, hist: b.hist } }; }
         else b.last = this.spot[s];
       }
     }
@@ -95,15 +95,7 @@
       }
       return (this.cdl[sym] = out);
     }
-    async expiries(sym) {
-      const today = QT.istDate(), out = [];
-      for (let m = 0; m < 4; m++) {
-        const d = new Date(Date.UTC(+today.slice(0, 4), +today.slice(5, 7) + m, 0)); // last day of month
-        while (d.getUTCDay() !== 2) d.setUTCDate(d.getUTCDate() - 1); // last Tuesday
-        out.push(d.toISOString().slice(0, 10));
-      }
-      return out;
-    }
+    async expiries() { return QT.fallbackExpiries(QT.istDate(), this.holidays); }
     async chain(sym, expiry) {
       const spot = this.spot[sym], step = QT.strikeStep(sym, spot), atm = Math.round(spot / step) * step;
       const T = Math.max(QT.daysBetween(QT.istDate(), expiry), 1) / 365, iv = (this.vix / 100) * 1.3, r = rng(hash(sym + expiry));
@@ -120,5 +112,25 @@
     }
   }
 
-  QT.makeFeed = (S) => (S.mode === 'live' ? new UpstoxFeed(S.token) : new DemoFeed());
+  // Custom JSON feed: your own adapter server that returns the formats documented in the README
+  class CustomFeed {
+    constructor(url, headers) { this.base = String(url || '').replace(/\/$/, ''); this.name = 'LIVE'; this.token = this.base; try { this.h = JSON.parse(headers || '{}'); } catch (e) { this.h = {}; } }
+    async get(path, params) {
+      if (!this.base) throw new Error('Custom feed URL is empty (Settings > Data feed)');
+      const qs = params ? '?' + Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&') : '';
+      const r = await fetch(this.base + path + qs, { headers: { Accept: 'application/json', ...this.h } });
+      if (!r.ok) throw new Error('Custom feed ' + path + ' -> HTTP ' + r.status);
+      return r.json();
+    }
+    async quotes() { const j = await this.get('/quotes'); return { q: j.quotes || {}, vix: j.vix ?? null }; }
+    async candles(sym) { return (await this.get('/candles', { symbol: sym, tf: 'day' })).candles; }
+    async closed(sym, tf) { const j = await this.get('/closed', { symbol: sym, tf }); return j && j.close ? { ts: j.ts, close: j.close, hist: j.hist || [j.close] } : null; }
+    async expiries(sym) { return (await this.get('/expiries', { symbol: sym })).expiries || []; }
+    async chain(sym, expiry) {
+      const j = await this.get('/chain', { symbol: sym, expiry }), m = new Map();
+      (j.rows || []).forEach((r) => m.set(r.strike, { CE: r.CE, PE: r.PE }));
+      return m;
+    }
+  }
+  QT.makeFeed = (S) => { const f = S.mode === 'live' ? new UpstoxFeed(S.token) : S.mode === 'custom' ? new CustomFeed(S.feedUrl, S.feedHeaders) : new DemoFeed(); f.holidays = S.holidays; return f; };
 })();

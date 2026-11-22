@@ -28,6 +28,21 @@
 
     logOrder(o) { const rec = { id: 'ORD-' + pad(++P.st.oseq, 5), time: new Date().toISOString(), ...o }; P.st.orders.unshift(rec); if (P.st.orders.length > 800) P.st.orders.pop(); return rec; },
 
+    todayRealized() {
+      const d = QT.istDate();
+      return r2(P.closed().filter((t) => t.exitTime && new Date(new Date(t.exitTime).getTime() + 19800000).toISOString().slice(0, 10) === d).reduce((x, t) => x + t.pnl, 0));
+    },
+    // money management: lots from risk budget (scaled by conviction) within margin caps - "AI" sizing; or the workbook's profit-goal lots
+    sizeLots(row, S) {
+      const eq = P.equity(S), lot = row.lot;
+      const lossPerLot = Math.max(0.05, Math.abs(row.slPnl)) * lot, marginPerLot = Math.max(1, (row.debit ? row.net : row.maxLoss) * lot);
+      const room = Math.min(eq * S.marginPerTradePct, eq * S.maxUtilPct - P.margin(), P.available(S));
+      const byMargin = Math.floor(room / marginPerLot);
+      if (S.sizing === 'workbook') return Math.max(0, Math.min(row.lots, byMargin));
+      const budget = eq * S.riskPct * (0.5 + (row.conviction || 50) / 100);
+      return Math.max(0, Math.min(Math.floor(budget / lossPerLot), byMargin, S.maxLots));
+    },
+
     // place an order (always logged). src: 'auto' | 'manual'
     enter(row, S, spots, src, meta) {
       meta = meta || {};
@@ -38,21 +53,31 @@
       if (!QT.canTrade(S, src)) return reject(`Outside trading time ${S.tradeStart}-${S.tradeEnd} IST`);
       if (!S.allowDup && P.open().some((t) => t.sym === row.sym)) return reject('Position already open in ' + row.sym);
       if (P.open().length >= S.maxOpen) return reject('Max open positions (' + S.maxOpen + ') reached');
+      const eq = P.equity(S), day = QT.istDate();
+      if (P.st.trades.filter((t) => t.entryDay === day).length >= S.maxTradesPerDay) return reject('Max trades per day (' + S.maxTradesPerDay + ') reached');
+      if (P.todayRealized() <= -eq * S.dailyLossPct) return reject(`Daily loss limit (${(S.dailyLossPct * 100).toFixed(1)}% of capital) reached - no new orders today`);
+      const lots = P.sizeLots(row, S);
+      if (lots < 1) return reject(`Capital limits: no room for 1 lot (free margin ${Math.round(P.available(S))}, utilisation cap ${(S.maxUtilPct * 100).toFixed(0)}%, per-trade cap ${(S.marginPerTradePct * 100).toFixed(0)}%, risk ${(S.riskPct * 100).toFixed(1)}%)`);
+      const qty = lots * row.lot; base.lots = lots; base.qty = qty;
       const slip = S.slipPct;
       const legs = row.legs.map((l) => ({ a: l.a, t: l.t, K: l.K, key: l.key, fill: r2(l.a === 'B' ? l.p * (1 + slip) : l.p * (1 - slip)) }));
-      const net = r2(legs.reduce((s, l) => s + (l.a === 'B' ? l.fill : -l.fill), 0));
-      const margin = Math.round(net > 0 ? net * row.qty : row.maxLoss * row.qty);
+      const net = r2(legs.reduce((x, l) => x + (l.a === 'B' ? l.fill : -l.fill), 0));
+      const margin = Math.round(net > 0 ? net * qty : row.maxLoss * qty);
       if (margin > P.available(S)) return reject(`Insufficient funds: margin ${margin} > available ${Math.round(P.available(S))}`);
-      const ch = P.charges(legs.map((l) => ({ side: l.a, price: l.fill, qty: row.qty })), S);
-      const tid = 'T-' + pad(++P.st.seq, 4);
+      const ch = P.charges(legs.map((l) => ({ side: l.a, price: l.fill, qty })), S);
+      const tid = 'PT-' + pad(++P.st.seq, 4);
       const o = P.logOrder({ ...base, status: 'COMPLETE', reason: '', tradeId: tid, fillNet: net, legs: legs.map((l) => ({ a: l.a, t: l.t, K: l.K, px: l.fill })) });
       const t = {
         id: tid, orderId: o.id, time: o.time, sym: row.sym, signal: row.decision, conviction: row.conviction, strat: row.strat, stratName: row.stratName, bias: row.bias,
-        lots: row.lots, qty: row.qty, lot: row.lot, expiry: row.expiry, exitBy: row.exitBy, legs, net, margin, chEntry: ch, entrySpot: spots[row.sym],
+        lots, qty, lot: row.lot, expiry: row.expiry, exitBy: row.exitBy, legs, net, margin, chEntry: ch, entrySpot: spots[row.sym],
         targetSpot: row.targetSpot, slSpot: row.slSpot, tpPnl: row.tpPnl, slPnl: row.slPnl, src: row.src, origin: src, candle: meta.candle || null,
-        status: 'OPEN', pnlGross: 0, curSpot: spots[row.sym], val: net, why: row.verdict || '',
+        status: 'OPEN', pnlGross: 0, curSpot: spots[row.sym], val: net, why: row.verdict || '', ma20: meta.ma20 || null, range: row.range || null,
+        exitTarget: row.exitTarget, exitSL: row.exitSL, profitAtTarget: Math.round(row.tpPnl * qty), lossAtSL: Math.round(-row.slPnl * qty), gate: row.gate, details: row.details, buyArea: row.buyArea,
+        targetTxt: row.targetTxt, slTxt: row.slTxt, plan: row.plan, entryDay: day, debit: row.debit, peak: 0,
+        ctx: { vix: meta.vix ?? null, edge: row.ag ? Math.abs(row.ag.edge) : null, streak: row.streak || 1, a2: row.a2 ? row.a2.score : null, conv1: row.conv1 ?? null, dte: row.dte, tf: S.candleTf, side: row.decision },
       };
       P.st.trades.unshift(t); P.save();
+      if (P.onEnter) P.onEnter(t, row, o);
       return { ok: true, trade: t, order: o };
     },
 
@@ -67,9 +92,10 @@
       return v;
     },
 
-    // spots = live prices; sig = last CLOSED candle closes (used for spot SL/target when S.closeExit)
-    markAll(S, spots, chains, today, sig) {
+    // spots = live prices; sig = last CLOSED candle closes; ma20 = {sym: 20-DMA}
+    markAll(S, spots, chains, today, sig, ma20) {
       const out = [];
+      const reasonTime = (S.mode === 'demo' && S.demoIgnoreHours) || QT.istMin() >= 915; // "closes" = near the daily close
       for (const t of P.open()) {
         const ch = chains[t.sym + '|' + t.expiry], v = P.value(t, ch);
         if (spots[t.sym]) t.curSpot = spots[t.sym];
@@ -77,14 +103,31 @@
         const sp = S.closeExit && sig && sig[t.sym] ? sig[t.sym] : t.curSpot;
         const pps = t.val - t.net;
         let why = null;
-        if (v != null) { if (pps >= t.tpPnl) why = 'TARGET HIT'; else if (pps <= t.slPnl) why = 'SL HIT'; }
+        if (v != null) {
+          t.peak = Math.max(t.peak || 0, pps);
+          if (pps >= t.tpPnl * (S.bookPct || 1)) why = 'TARGET HIT'; // profit is booked any time the market is open
+          else if (pps <= t.slPnl) why = 'SL HIT';
+          else if (S.lockProfit && t.peak >= t.tpPnl * S.lockAt && pps <= t.tpPnl * S.lockKeep) why = 'PROFIT LOCK';
+        }
         if (!why && t.targetSpot) {
           if (t.bias === 'U') why = sp >= t.targetSpot ? 'TARGET HIT' : sp <= t.slSpot ? 'SL HIT' : null;
           else if (t.bias === 'D') why = sp <= t.targetSpot ? 'TARGET HIT' : sp >= t.slSpot ? 'SL HIT' : null;
         }
-        if (!why && today >= t.exitBy) why = 'EXIT-BY';
+        // Rule 8 - entry reason gone (trading plan): spot closes through the 20-DMA / leaves the expected range
+        if (!why && S.maExit && reasonTime) {
+          const m = (ma20 && ma20[t.sym]) || t.ma20, c = sig && sig[t.sym] ? sig[t.sym] : t.curSpot;
+          if (t.bias === 'U' && m && c < m) why = 'ENTRY REASON GONE';
+          else if (t.bias === 'D' && m && c > m) why = 'ENTRY REASON GONE';
+          else if (t.range && (c < t.range[0] || c > t.range[1])) why = 'ENTRY REASON GONE';
+        }
+        // straddle / strangle: "exit if still flat at 1/2 time"
+        if (!why && t.bias === 'N' && !t.range) {
+          const tot = QT.daysBetween(t.entryDay || today, t.exitBy), el = QT.daysBetween(t.entryDay || today, today);
+          if (tot > 0 && el >= tot / 2 && Math.abs(t.curSpot / t.entrySpot - 1) < S.targetPct / 2) why = 'FLAT AT 1/2 TIME';
+        }
+        if (!why && today >= t.exitBy) why = 'EXIT-BY DUE';
         if (!why && today >= t.expiry) why = 'EXPIRED';
-        if (why && v != null && QT.marketOpen()) { P.close(t, why, S, ch); out.push(t); }
+        if (why && v != null && (QT.marketOpen() || (S.mode === 'demo' && S.demoIgnoreHours))) { P.close(t, why, S, ch); out.push(t); }
       }
       P.st.curve.push([Date.now(), P.equity(S)]); if (P.st.curve.length > 600) P.st.curve.shift();
       P.save();
@@ -107,6 +150,7 @@
       P.logOrder({ sym: t.sym, stratName: t.stratName, src: why === 'MANUAL' ? 'manual' : 'auto-exit', lots: t.lots, qty: t.qty, expiry: t.expiry, signal: 'EXIT', status: 'COMPLETE', reason: why, tradeId: t.id,
         legs: t.legs.map((l) => ({ a: l.a === 'B' ? 'S' : 'B', t: l.t, K: l.K, px: l.exitPx })), fillNet: r2(-exitVal) });
       P.st.realized = r2(P.st.realized + t.pnl); P.save();
+      if (P.onClose) P.onClose(t);
     },
 
     stats() {
@@ -114,9 +158,20 @@
       const gw = W.reduce((s, t) => s + t.pnl, 0), gl = -L.reduce((s, t) => s + t.pnl, 0);
       let eq = 0, pk = 0, dd = 0;
       [...c].sort((a, b) => a.exitTime.localeCompare(b.exitTime)).forEach((t) => { eq += t.pnl; pk = Math.max(pk, eq); dd = Math.max(dd, pk - eq); });
-      return { total: P.st.trades.length, open: P.open().length, closed: c.length, wins: W.length, losses: L.length, winRate: c.length ? (100 * W.length) / c.length : 0,
+      const th = c.filter((t) => t.status === 'TARGET HIT').length, sl = c.filter((t) => t.status === 'SL HIT').length, eb = c.filter((t) => t.status === 'EXIT-BY DUE').length;
+      return { total: P.st.trades.length, open: P.open().length, closed: c.length, wins: W.length, losses: L.length, winRate: c.length ? (100 * W.length) / c.length : 0, targetHits: th, slHits: sl, exitBy: eb, targetWinRate: c.length ? (100 * th) / c.length : 0,
         avgWin: W.length ? gw / W.length : 0, avgLoss: L.length ? -gl / L.length : 0, pf: gl ? gw / gl : gw ? Infinity : 0, maxDD: dd,
         charges: r2(P.st.trades.reduce((s, t) => s + (t.chEntry || 0) + (t.chExit || 0), 0)) };
+    },
+    // win-rate tables: group closed trades by any key
+    group(keyFn, labels) {
+      const m = {}; (labels || []).forEach((l) => (m[l] = []));
+      P.closed().forEach((t) => { const k = keyFn(t); if (k == null) return; (m[k] = m[k] || []).push(t); });
+      return Object.entries(m).map(([k, a]) => {
+        const w = a.filter((t) => t.pnl > 0), lo = a.filter((t) => t.pnl <= 0), gw = w.reduce((x, t) => x + t.pnl, 0), gl = -lo.reduce((x, t) => x + t.pnl, 0);
+        return { k, n: a.length, wins: w.length, losses: lo.length, winRate: a.length ? (100 * w.length) / a.length : null, total: r2(a.reduce((x, t) => x + t.pnl, 0)), avg: a.length ? r2(a.reduce((x, t) => x + t.pnl, 0) / a.length) : 0,
+          target: a.filter((t) => t.status === 'TARGET HIT').length, sl: a.filter((t) => t.status === 'SL HIT').length, other: a.filter((t) => !['TARGET HIT', 'SL HIT'].includes(t.status)).length, pf: gl ? gw / gl : gw ? Infinity : 0 };
+      });
     },
     daywise() {
       const m = {};
@@ -124,9 +179,9 @@
       return Object.values(m).sort((a, b) => b.d.localeCompare(a.d));
     },
     csv() {
-      const h = 'trade_id,order_id,open_time,close_time,symbol,strategy,origin,signal,conviction,lots,qty,expiry,legs(entry),entry_net,exit_net,status,gross_pnl,charges,net_pnl';
-      const rows = P.st.trades.map((t) => [t.id, t.orderId, t.time, t.exitTime || '', t.sym, t.stratName, t.origin, t.signal, t.conviction, t.lots, t.qty, t.expiry,
-        '"' + t.legs.map((l) => `${l.a}${l.K}${l.t}@${l.fill}`).join(' ') + '"', t.net, t.exitNet ?? '', t.status, t.pnlGross ?? '', (t.chEntry || 0) + (t.chExit || 0), t.pnl ?? ''].join(','));
+      const h = 'trade_id,order_id,open_time,close_time,symbol,strategy,origin,signal,conviction,lots,qty,dr_cr,entry_spot,target_spot,sl_spot,expiry,exit_by,legs(entry),entry_prem,target_prem,sl_prem,exit_net,profit_at_target,loss_at_sl,status,exit_spot,gross_pnl,charges,net_pnl,book_rules';
+      const rows = P.st.trades.map((t) => [t.id, t.orderId, t.time, t.exitTime || '', t.sym, t.stratName, t.origin, t.signal, t.conviction, t.lots, t.qty, t.net > 0 ? 'Debit' : 'Credit', t.entrySpot, t.targetSpot ?? '', t.slSpot ?? '', t.expiry, t.exitBy,
+        '"' + t.legs.map((l) => `${l.a}${l.K}${l.t}@${l.fill}`).join(' ') + '"', t.net, t.exitTarget ?? '', t.exitSL ?? '', t.exitNet ?? '', t.profitAtTarget ?? '', t.lossAtSL ?? '', t.status, t.exitSpot ?? '', t.pnlGross ?? '', (t.chEntry || 0) + (t.chExit || 0), t.pnl ?? '', '"' + (t.details || '') + '"'].join(','));
       return [h, ...rows].join('\n');
     },
   });
