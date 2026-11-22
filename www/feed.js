@@ -6,9 +6,10 @@
 
   class UpstoxFeed {
     constructor(token) { this.token = (token || '').trim(); this.name = 'LIVE'; }
-    async get(path, params) {
+    get3(path, params) { return this.get(path, params, 'https://api.upstox.com/v3'); }
+    async get(path, params, base) {
       const qs = params ? '?' + Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&') : '';
-      const r = await fetch(BASE + path + qs, { headers: { Authorization: 'Bearer ' + this.token, Accept: 'application/json' } });
+      const r = await fetch((base || BASE) + path + qs, { headers: { Authorization: 'Bearer ' + this.token, Accept: 'application/json' } });
       const txt = await r.text();
       let j; try { j = JSON.parse(txt); } catch (e) { throw new Error('Bad response (' + r.status + ')'); }
       if (!r.ok || j.status === 'error') {
@@ -32,6 +33,13 @@
       const to = QT.istDate(), from = QT.addDays(to, -380);
       const d = await this.get(`/historical-candle/${encodeURIComponent(U()[sym].key)}/day/${to}/${from}`);
       return d.candles; // newest first
+    }
+    // last fully CLOSED intraday candle at timeframe tf (minutes) -> {ts, close} or null
+    async closed(sym, tf) {
+      const d = await this.get3(`/historical-candle/intraday/${encodeURIComponent(U()[sym].key)}/minutes/${tf}`);
+      const now = Date.now();
+      const c = (d.candles || []).find((k) => new Date(k[0]).getTime() + tf * 60000 <= now);
+      return c ? { ts: c[0], close: c[4] } : null;
     }
     async expiries(sym) {
       const d = await this.get('/option/contract', { instrument_key: U()[sym].key });
@@ -58,8 +66,20 @@
       // random walk step per refresh (~0.35% / tick) so demo trades can reach targets/stops
       for (const s of Object.keys(this.spot)) this.spot[s] = Math.round(this.spot[s] * (1 + (this.r() - 0.5) * 0.007) * 20) / 20;
       this.vix = Math.max(11, this.vix + (this.r() - 0.5) * 0.3);
+      this.track();
       return { q: { ...this.spot }, vix: this.vix };
     }
+    // demo candle builder: wall-clock buckets; the previous bucket's last price is the CLOSED candle
+    track() {
+      const id = QT.candleId(this.tf || 15); this.bk = this.bk || {};
+      for (const s of Object.keys(this.spot)) {
+        const b = this.bk[s];
+        if (!b) this.bk[s] = { id, last: this.spot[s], closed: { ts: new Date().toISOString(), close: U()[s].ltp } };
+        else if (b.id !== id) this.bk[s] = { id, last: this.spot[s], closed: { ts: new Date().toISOString(), close: b.last } };
+        else b.last = this.spot[s];
+      }
+    }
+    async closed(sym, tf) { this.tf = tf; if (!this.bk) this.track(); return this.bk[sym].closed; }
     async candles(sym) {
       if (this.cdl[sym]) return this.cdl[sym];
       const u = U()[sym], r = rng(hash(sym)), n = 260, out = [];

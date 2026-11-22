@@ -11,8 +11,11 @@
     // book rules
     minOI: 100, minVol: 500000, maxBA: 0.1, minYield: 0.1, minDTEBuy: 60, maxDTESell: 35, exitBefore: 30, creditTP: 0.5,
     // paper
-    capital: 1000000, autoTrade: true, minConviction: 50, maxOpen: 10, allowOffHours: false, allowDup: false,
+    capital: 1000000, autoTrade: true, minConviction: 50, maxOpen: 10, allowDup: false,
     charges: true, brokerage: 20, sttPct: 0.001, slipPct: 0.003,
+    // trading time + closed-candle logic
+    tradeStart: '09:30', tradeEnd: '15:00', demoIgnoreHours: true, manualOutside: false,
+    candleTf: 15, confirmN: 1, closeExit: true, theme: 'dark',
   };
 
   // Strategy map (Guy Cohen) - legs: [action, type, offset in width units]
@@ -37,6 +40,15 @@
   QT.istDate = () => QT.istNow().toISOString().slice(0, 10);
   QT.daysBetween = (a, b) => Math.round((Date.UTC(+b.slice(0, 4), +b.slice(5, 7) - 1, +b.slice(8, 10)) - Date.UTC(+a.slice(0, 4), +a.slice(5, 7) - 1, +a.slice(8, 10))) / 864e5);
   QT.addDays = (d, n) => new Date(Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10)) + n * 864e5).toISOString().slice(0, 10);
+  QT.istMin = () => { const d = QT.istNow(); return d.getUTCHours() * 60 + d.getUTCMinutes(); };
+  QT.hm = (t) => { const [h, m] = String(t).split(':'); return +h * 60 + +m; };
+  QT.isWeekday = () => { const w = QT.istNow().getUTCDay(); return w >= 1 && w <= 5; };
+  // entries/orders allowed only inside the trading window set by the user
+  QT.inWindow = (S) => QT.isWeekday() && QT.istMin() >= QT.hm(S.tradeStart) && QT.istMin() <= QT.hm(S.tradeEnd);
+  QT.canTrade = (S, src) => (S.mode === 'demo' && S.demoIgnoreHours) || (src === 'manual' && S.manualOutside) || QT.inWindow(S);
+  // id of the last CLOSED candle bucket (aligned to 09:15 IST). A signal is only evaluated when this id changes.
+  QT.candleId = (tf) => { const t = Date.now() + 19800000 - 5000, day = Math.floor(t / 864e5), mins = (t % 864e5) / 60000 - 555; return day * 1000 + Math.floor(mins / tf); };
+  QT.nextCloseSecs = (tf) => { const t = Date.now() + 19800000, mins = (t % 864e5) / 60000 - 555, nxt = (Math.floor(mins / tf) + 1) * tf; return Math.max(0, Math.round((nxt - mins) * 60)); };
   QT.marketOpen = () => {
     const d = QT.istNow(), wd = d.getUTCDay(), m = d.getUTCHours() * 60 + d.getUTCMinutes();
     return wd >= 1 && wd <= 5 && m >= 555 && m <= 930;
@@ -72,10 +84,13 @@
   // ---------- indicators & agents ----------
   QT.indicators = function (candles) { // newest first [ts,o,h,l,c,v]
     if (!candles || candles.length < 25) return null;
+    const today = QT.istDate(), done = QT.istMin() >= 930;
+    // closed-candle rule: drop today's still-forming daily candle
+    candles = candles.filter((c) => String(c[0]).slice(0, 10) < today || (done && QT.isWeekday()));
+    if (candles.length < 25) return null;
     const cl = candles.map((c) => c[4]);
     const hi = candles.map((c) => c[2]), lo = candles.map((c) => c[3]);
-    const today = QT.istDate();
-    const prevC = candles.find((c) => String(c[0]).slice(0, 10) < today) || candles[1];
+    const prevC = candles.find((c) => String(c[0]).slice(0, 10) < today) || candles[0];
     return {
       ma20: avg(cl.slice(0, 20)), ma50: avg(cl.slice(0, 50)), hi52: Math.max(...hi), lo52: Math.min(...lo),
       hi60: Math.max(...hi.slice(0, 60)), lo60: Math.min(...lo.slice(0, 60)),
@@ -208,10 +223,11 @@
   QT.evaluate = function (sym, snap, S, chainMap, expiries) {
     const spot = snap.quotes[sym], ind = snap.ind[sym];
     if (!spot || !ind) return { sym, decision: 'NO DATA', reason: 'no price/candle data' };
-    const ag = QT.agents(sym, spot, ind, snap.niftyTS);
+    const sig = (snap.sig && snap.sig[sym]) || spot; // last CLOSED candle close
+    const ag = QT.agents(sym, sig, ind, snap.niftyTS);
     const strat = QT.pickStrategy(ag.ts, ag.day, snap.vix, S.vixThreshold);
     const st = QT.STRATS[strat];
-    const base = { sym, spot, ag, strat, stratName: st.name };
+    const base = { sym, spot, sig, ag, strat, stratName: st.name };
     if (!S.strat[strat]) return { ...base, decision: 'IGNORED', reason: `strategy #${strat} ${st.name} is OFF` };
     let decision = '', conviction = 0;
     if (st.bias === 'U' && ag.edge >= S.minEdge) { decision = 'BUY'; conviction = Math.round((100 * ag.edge) / 6); }
