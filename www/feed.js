@@ -34,6 +34,10 @@
       const d = await this.get(`/historical-candle/${encodeURIComponent(U()[sym].key)}/day/${to}/${from}`);
       return d.candles; // newest first
     }
+    async lotSize(sym) {
+      const d = await this.get('/option/contract', { instrument_key: U()[sym].key });
+      const c = (d || []).find((x) => x.lot_size > 0); return c ? +c.lot_size : null;
+    }
     // last fully CLOSED intraday candle at timeframe tf (minutes) -> {ts, close} or null
     async closed(sym, tf) {
       const d = await this.get3(`/historical-candle/intraday/${encodeURIComponent(U()[sym].key)}/minutes/${tf}`);

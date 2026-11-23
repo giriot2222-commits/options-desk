@@ -12,11 +12,16 @@
   let S = { ...QT.DEFAULTS, strat: { ...QT.DEFAULTS.strat }, favs: [], force: {}, spotOv: {}, tuneLog: [], lastTuneN: 0 };
   try { const j = JSON.parse(localStorage.getItem('qt_cfg4')); if (j) S = { ...S, ...j, strat: { ...S.strat, ...(j.strat || {}) }, force: j.force || {}, spotOv: j.spotOv || {}, tuneLog: j.tuneLog || [] }; } catch (e) {}
   const saveS = () => localStorage.setItem('qt_cfg4', JSON.stringify(S));
-  QT.Paper.load(); QT.Alerts.load();
+  QT.Paper.load(); QT.Alerts.load(); QT.Run.load();
+  let freshStart = false;
+  try { if (localStorage.getItem('qt_dataver') !== '5') { QT.Paper.reset(S.capital); QT.Alerts.log = []; QT.Alerts.seen = {}; QT.Alerts.save(); QT.Run.clear(); localStorage.setItem('qt_dataver', '5'); freshStart = true; } } catch (e) {}
+  if (!Array.isArray(S.days)) S.days = [1, 2, 3, 4, 5];
 
   const A = { tab: 'watch', wl: 'sig', q: '', ag: 'debate', df: 'all', pq: '', ord: 'all', pos: 'open', hf: 'all', more: 'set', hseg: 'reg', modal: null, hist: {}, feed: null, snap: null, rows: [], ignored: [], all: {}, order: [],
     expiries: { stock: [], index: [] }, status: '', last: null, lastOk: null, busy: false, toast: '', chains: {}, open: {}, sheet: null, ind: {}, sig: null, sigTs: {}, streak: {}, tried: {}, cid: null, dirty: false };
   const SYMS = Object.keys(QT.UNIVERSE);
+  SYMS.forEach((s) => (QT.UNIVERSE[s].wlot = QT.UNIVERSE[s].lot));
+  try { const c = JSON.parse(localStorage.getItem('qt_lots')); if (c && c.m && S.mode === 'live') SYMS.forEach((s) => { if (c.m[s]) { QT.UNIVERSE[s].lot = c.m[s]; QT.UNIVERSE[s].live = true; } }); } catch (e) {}
 
   // ---------- data refresh ----------
   async function pool(items, n, fn) {
@@ -42,6 +47,13 @@
       const q = await A.feed.quotes();
       A.lastOk = Date.now();
       await pool(SYMS.filter((s) => !A.ind[s]), 5, async (s) => { A.ind[s] = QT.indicators(await A.feed.candles(s)); });
+      // lot sizes: take the exchange lot size from Upstox (the workbook list can be out of date)
+      if (S.mode === 'live' && S.lotSync && A.lotDay !== today) {
+        A.lotDay = today; const changed = [];
+        await pool(SYMS, 3, async (s) => { const l = await A.feed.lotSize(s); if (l) { if (l !== QT.UNIVERSE[s].lot) changed.push(`${s} ${QT.UNIVERSE[s].lot}→${l}`); QT.UNIVERSE[s].lot = l; QT.UNIVERSE[s].live = true; } });
+        try { const m = {}; SYMS.forEach((s) => (m[s] = QT.UNIVERSE[s].lot)); localStorage.setItem('qt_lots', JSON.stringify({ d: today, m })); } catch (e) {}
+        if (changed.length) { A.dirty = true; QT.Alerts.add(S, 'INFO', '', 'Lot sizes updated from Upstox: ' + changed.join(', ')); toast('Lot sizes updated from Upstox (' + changed.length + ')'); }
+      }
       if (!A.expiries.stock.length) {
         let st = [], ix = [];
         try { [st, ix] = await Promise.all([A.feed.expiries('RELIANCE'), A.feed.expiries('NIFTY')]); } catch (e) {}
@@ -51,7 +63,9 @@
       const vix = q.vix || (A.snap && A.snap.vix) || QT.DEMO_VIX;
       const cid = QT.candleId(S.candleTf);
       const newBoundary = A.cid !== cid || A.tfUsed !== S.candleTf || !S.closedCandle;
+      let evaluated = false;
       if (newBoundary || A.dirty || !A.sig) {
+        evaluated = true;
         // CLOSED-CANDLE LOGIC: signals use only the last fully closed candle
         const sig = {}, sigTs = {};
         await pool(SYMS, 5, async (s) => { const c = await A.feed.closed(s, S.candleTf); if (c) { sig[s] = c.close; sigTs[s] = c.ts; A.hist[s] = c.hist || [c.close]; } });
@@ -76,17 +90,19 @@
         A.rows.forEach((r) => (r.streak = (A.streak[r.sym] || { n: 1 }).n));
         A.all = {}; rows.forEach((r) => (A.all[r.sym] = r));
         A.chains = chains;
+        if (newBoundary) QT.Run.add(`Candle ${S.candleTf}m closed - ${A.rows.length} signal(s)` + (A.rows.length ? ': ' + A.rows.slice(0, 6).map((r) => `${r.sym} ${r.decision} ${r.conviction}`).join(', ') : ''));
         // alert: NEW SIGNAL once per day per trade, conviction >= threshold
         for (const r of A.rows) if (r.conviction >= S.alertMinConv) QT.Alerts.add(S, 'NEW SIGNAL', r.sym, `${r.decision} ${r.sym} (${r.stratName}) conviction ${r.conviction} | ${r.ticket.join(' | ')}`, 'sig|' + keyOf(r));
       }
       A.snap = { quotes: q.q, ind: A.ind, vix, today, sig: A.sig, hist: A.hist };
       // mark open paper positions
+      // option prices of open positions are re-fetched on EVERY refresh (a failed fetch = no mark, never a stale one)
       const ch2 = { ...A.chains };
-      const need = [...new Set(QT.Paper.open().map((t) => t.sym + '|' + t.expiry))].filter((k) => !ch2[k]);
-      await pool(need, 4, async (k) => { const [s, e] = k.split('|'); ch2[k] = await A.feed.chain(s, e); });
+      const okeys = [...new Set(QT.Paper.open().map((t) => t.sym + '|' + t.expiry))].filter((k) => !(evaluated && A.chains[k]));
+      await pool(okeys, 4, async (k) => { const [s, e] = k.split('|'); try { ch2[k] = await A.feed.chain(s, e); } catch (er) { delete ch2[k]; A.lastErr = er.message; } });
       A.chains = ch2;
       const ma = {}; SYMS.forEach((s) => { if (A.ind[s]) ma[s] = A.ind[s].ma20; });
-      QT.Paper.markAll(S, q.q, ch2, today, A.sig, ma).forEach((t) => { toast(`${t.sym} ${t.status}: ${inr(t.pnl)}`); QT.Alerts.add(S, t.status, t.sym, `${t.sym} ${t.stratName} ${t.status} @ spot ${t.exitSpot} | P&L ${inr(t.pnl)}`); });
+      QT.Paper.markAll(S, q.q, ch2, today, A.sig, ma, vix).forEach((t) => { QT.Run.add(`EXIT ${t.sym} ${t.status}: net ${inr(t.pnl)}`); toast(`${t.sym} ${t.status}: ${inr(t.pnl)}`); QT.Alerts.add(S, t.status, t.sym, `${t.sym} ${t.stratName} ${t.status} @ spot ${t.exitSpot} | P&L ${inr(t.pnl)}`); });
       // AI tuning of filters from paper-trade history (only when enabled in Settings)
       const tuned = QT.Optimizer.autoTune(S);
       if (tuned.length) { saveS(); A.dirty = true; QT.Alerts.add(S, 'TUNING', '', 'AI tuning changed: ' + tuned.map((c) => `${c.label} (${c.reason})`).join(' | ')); toast('AI tuning applied ' + tuned.length + ' change(s)'); }
@@ -99,6 +115,7 @@
           if (!S.allowDup && QT.Paper.open().some((t) => t.sym === r.sym)) continue;
           A.tried[k] = 1;
           const res = await placeOrder(r, 'auto');
+          QT.Run.add(res.ok ? `ORDER ${r.sym} ${r.decision} ${r.stratName} ${res.trade.lots}L executed` : `ORDER ${r.sym} rejected: ${res.msg}`);
           if (res.ok) { n++; QT.Alerts.add(S, 'PAPER ENTRY', r.sym, `Auto-Registered ${r.decision} on ${r.sym} (${r.stratName}) @ Spot ${r.spot} | Ticket: ${r.ticket.join(' | ')} | Target Spot: ${r.targetSpot ?? '-'} | SL Spot: ${r.slSpot ?? '-'}`); }
         }
         if (n) toast(`Auto: ${n} paper order(s) executed`);
@@ -146,16 +163,20 @@
     return age <= S.maxAge && QT.marketOpen() ? ['on', '● LIVE'] : ['off', '● DELAYED'];
   }
   function paintHeader() {
-    const s = A.snap, win = QT.canTrade(S, 'auto'), [dc, dl] = dataMode();
+    const s = A.snap, ph = QT.phase(S), [dc, dl] = dataMode();
     const nq = s ? s.quotes.NIFTY : null, nprev = s && A.ind.NIFTY ? A.ind.NIFTY.prevClose : null, nc = nq && nprev ? (nq / nprev - 1) * 100 : 0;
     const age = A.lastOk ? Math.round((Date.now() - A.lastOk) / 1000) : null;
     $('#hdr').innerHTML = `<div class="h1"><span class="brand">${LOGO} Options Desk</span><span><span class="pill ${dc}">${dl}${age != null && S.mode !== 'demo' ? ' ' + age + 's' : ''}</span> <button class="btn sm ghost" data-act="refresh">${A.busy ? '…' : '↻'}</button></span></div>
       <div class="idx"><span>NIFTY <b>${nq ? num(nq) : '-'}</b> <span class="${cls(nc)}">${nq ? (nc >= 0 ? '+' : '') + nc.toFixed(2) + '%' : ''}</span></span><span>VIX <b>${s ? s.vix.toFixed(2) : '-'}</b></span><span>Goal <b>${inr(S.profitGoal)}</b></span></div><div class="edu">Educational purpose only · not investment advice</div>
-      <div class="st"><span class="pill ${win ? 'on' : 'off'}">${win ? 'Orders OPEN' : 'Orders CLOSED'} ${esc(S.tradeStart)}–${esc(S.tradeEnd)}</span><span class="pill">Candle ${S.candleTf}m · next close <b id="cd">--:--</b></span>${A.last ? `<span>upd ${A.last.toLocaleTimeString('en-IN', { hour12: false })}</span>` : ''}</div>
+      <div class="st"><span class="pill ${ph.on ? 'on' : 'off'}">${esc(ph.label)}</span><span class="pill" id="phn">${ph.next ? esc(ph.next.label) + ' in --:--' : 'New orders ' + esc(S.tradeStart) + '–' + esc(S.tradeEnd)}</span><span class="pill">Candle ${S.candleTf}m · next close <b id="cd">--:--</b></span>${A.last ? `<span>upd ${A.last.toLocaleTimeString('en-IN', { hour12: false })}</span>` : ''}</div>
       ${A.status ? `<div class="sub ${/Error/.test(A.status) ? 'neg' : ''}">${esc(A.status)}</div>` : ''}`;
     tickClock();
   }
-  function tickClock() { const e = $('#cd'); if (e) { const sec = QT.nextCloseSecs(S.candleTf); e.textContent = String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(sec % 60).padStart(2, '0'); } }
+  function tickClock() {
+    const ph = QT.phase(S), pe = $('#phn');
+    if (pe && ph.next) { const sc = ph.next.secs; pe.textContent = `${ph.next.label} in ${String(Math.floor(sc / 3600)).padStart(2, '0')}:${String(Math.floor((sc % 3600) / 60)).padStart(2, '0')}:${String(sc % 60).padStart(2, '0')}`; }
+    if (A.lastPhase !== ph.key) { if (A.lastPhase) QT.Run.add('Phase: ' + ph.label); A.lastPhase = ph.key; }
+    const e = $('#cd'); if (e) { const sec = QT.nextCloseSecs(S.candleTf); e.textContent = String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(sec % 60).padStart(2, '0'); } }
   setInterval(tickClock, 1000);
 
   // ---------- helpers for views ----------
@@ -207,7 +228,7 @@
     const c = chgOf(sym), ind = A.ind[sym] || {}, r = A.all[sym], trig = isTrig(r), u = QT.UNIVERSE[sym];
     let h = `<div class="row"><span class="big">${sym}</span><span class="sp"></span><button class="star" data-act="fav" data-s="${sym}">${S.favs.includes(sym) ? '★' : '☆'}</button><button class="btn sm ghost" data-act="close-sheet">✕</button></div>
       <div class="row"><span class="big">${num(c.ltp)}</span><span class="${cls(c.pct)}">${c.pct >= 0 ? '+' : ''}${c.pct.toFixed(2)}%</span></div>
-      <div class="grid"><div>Prev close<b>${num(ind.prevClose)}</b></div><div>~20-DMA<b>${num(ind.ma20)}</b></div><div>~50-DMA<b>${num(ind.ma50)}</b></div><div>52W high / low<b>${num(ind.hi52, 0)} / ${num(ind.lo52, 0)}</b></div><div>60d high / low<b>${num(ind.hi60, 0)} / ${num(ind.lo60, 0)}</b></div><div>Lot · avg vol<b>${u.lot} · ${ind.avgVol ? Math.round(ind.avgVol / 1000) + 'k' : '-'}</b></div></div>
+      <div class="grid"><div>Prev close<b>${num(ind.prevClose)}</b></div><div>~20-DMA<b>${num(ind.ma20)}</b></div><div>~50-DMA<b>${num(ind.ma50)}</b></div><div>52W high / low<b>${num(ind.hi52, 0)} / ${num(ind.lo52, 0)}</b></div><div>60d high / low<b>${num(ind.hi60, 0)} / ${num(ind.lo60, 0)}</b></div><div>Lot (${u.live ? 'Upstox live' : 'workbook'}) · avg vol<b>${u.lot} · ${ind.avgVol ? Math.round(ind.avgVol / 1000) + 'k' : '-'}</b></div></div>
       <div class="sub">Closed ${S.candleTf}m candle: <b>${A.sig && A.sig[sym] ? num(A.sig[sym]) : '-'}</b>${A.sigTs[sym] ? ' @ ' + hhmm(A.sigTs[sym]) : ''} · agents use this close, not the live tick</div>`;
     if (!r) return h;
     h += `<div class="card" style="margin-top:10px"><h4>Agent 1 · book rules (Bull vs Bear)</h4>`;
@@ -277,15 +298,38 @@
     const P = QT.Paper, un = P.unrealized();
     return `<div class="tiles"><div>Equity<b>${inr(P.equity(S))}</b></div><div>Available<b>${inr(P.available(S))}</b></div><div>Margin used<b>${inr(P.margin())}</b></div><div>Realized<b class="${cls(P.st.realized)}">${inr(P.st.realized)}</b></div><div>Unrealized<b class="${cls(un)}">${inr(un)}</b></div><div>Total P&L<b class="${cls(P.st.realized + un)}">${inr(P.st.realized + un)}</b></div></div>`;
   }
+  // ---------- Today: trading phase, allowed days, today's run ----------
+  function todayPanel() {
+    const P = QT.Paper, ph = QT.phase(S), day = QT.istDate(), wd = QT.istNow().getUTCDay(), m = QT.istMin();
+    const isToday = (iso) => iso && new Date(new Date(iso).getTime() + 19800000).toISOString().slice(0, 10) === day;
+    const ords = P.st.orders.filter((o) => isToday(o.time)), done = ords.filter((o) => o.status === 'COMPLETE' && o.signal !== 'EXIT'), rej = ords.filter((o) => o.status === 'REJECTED');
+    const exits = P.closed().filter((t) => isToday(t.exitTime)), newT = P.st.trades.filter((t) => t.entryDay === day).length;
+    const pc = (x) => Math.max(0, Math.min(100, ((x - 555) / 375) * 100)), lim = P.equity(S) * S.dailyLossPct, rt = P.todayRealized();
+    const t0 = QT.hm(S.tradeStart), t1 = QT.hm(S.tradeEnd);
+    let h = `<div class="card"><div class="row"><b>Today · ${QT.dayName(wd)} ${day}</b><span class="sp"></span><span class="pill ${ph.on ? 'on' : 'off'}">${esc(ph.label)}</span></div>
+      <div class="tl"><div class="seg1 settle" style="left:0;width:${pc(t0)}%"></div><div class="seg1 win" style="left:${pc(t0)}%;width:${pc(t1) - pc(t0)}%"></div><div class="seg1 exit" style="left:${pc(t1)}%;width:${100 - pc(t1)}%"></div>${m >= 555 && m <= 930 ? `<div class="now" style="left:${pc(m)}%"></div>` : ''}</div>
+      <div class="tll"><span>09:15</span><span>${esc(S.tradeStart)}</span><span>${esc(S.tradeEnd)}</span><span>15:30</span></div>
+      <div class="sub">Monitor-only (grey) · new orders (green) · exit-only (amber). ${ph.next ? esc(ph.next.label) + '.' : ''}</div>
+      <div class="days">${[1, 2, 3, 4, 5, 6, 0].filter((d) => d >= 1 && d <= 5 || S.days.includes(d)).map((d) => `<span class="dchip ${S.days.includes(d) ? 'on' : ''} ${d === wd ? 'today' : ''}">${S.days.includes(d) ? '✓' : '✗'} ${QT.dayName(d)}</span>`).join('')}</div>
+      <div class="tiles"><div>Orders today<b>${done.length} done · ${rej.length} rej</b></div><div>New trades<b>${newT} / ${S.maxTradesPerDay}</b></div><div>Exits today<b>${exits.length}</b></div><div>Realized today<b class="${cls(rt)}">${inr(rt)}</b></div><div>Open now<b>${P.open().length} / ${S.maxOpen}</b></div><div>Loss limit used<b>${rt < 0 ? Math.min(100, (-rt / lim) * 100).toFixed(0) : 0}%</b></div></div>
+      <div class="btns"><button class="btn sm ghost" data-act="newsession">Clear all old orders &amp; start fresh</button></div></div>`;
+    const lg = QT.Run.log.filter((x) => isToday(x.t)).slice(0, 14);
+    h += `<div class="card"><h4>Today's run</h4>${lg.map((x) => `<div class="kv"><b>${hhmm(x.t)}</b> ${esc(x.msg)}</div>`).join('') || '<div class="sub">Nothing yet today.</div>'}</div>`;
+    return h;
+  }
   function positions() {
     const P = QT.Paper, list = A.pos === 'open' ? P.open() : P.closed();
-    let h = fundsTiles() + `<div class="seg">${[['open', 'Open ' + P.open().length], ['closed', 'Closed ' + P.closed().length]].map(([k, l]) => `<button class="${A.pos === k ? 'on' : ''}" data-act="pos" data-k="${k}">${l}</button>`).join('')}</div>`;
+    let h = todayPanel() + fundsTiles() + `<div class="seg">${[['open', 'Open ' + P.open().length], ['closed', 'Closed ' + P.closed().length]].map(([k, l]) => `<button class="${A.pos === k ? 'on' : ''}" data-act="pos" data-k="${k}">${l}</button>`).join('')}</div>`;
     h += list.map((t) => {
       const pnl = t.status === 'OPEN' ? (t.pnlGross || 0) - t.chEntry : t.pnl;
       return `<div class="card"><div class="row"><b>${t.sym}</b><span class="chip">${esc(t.stratName)}</span><span class="sp"></span><b class="${cls(pnl)}">${inr(pnl)}</b></div>
       <div class="sub">${t.id} · ${t.lots}L (${t.qty}) · exp ${t.expiry} · ${t.status === 'OPEN' ? 'exit by ' + t.exitBy : t.status}</div>
       <div class="tk">${t.legs.map((l) => `${l.a === 'B' ? 'BUY ' : 'SELL'} ${l.K} ${l.t} @ ${num(l.fill)}${l.exitPx != null ? ' → ' + num(l.exitPx) : ''}`).join('<br>')}</div>
       <div class="sub">Spot ${num(t.entrySpot)} → ${num(t.status === 'OPEN' ? t.curSpot : t.exitSpot)}${t.targetSpot ? ` · T ${num(t.targetSpot)} · SL ${num(t.slSpot)}` : t.targetTxt ? ' · ' + esc(t.targetTxt) : ''} · margin ${inr(t.margin)}</div>
+      <div class="sub">Profit at target <b class="pos">${inr(t.profitAtTarget)}</b> · Loss at SL <b class="neg">${inr(-t.lossAtSL)}</b> · P&L is marked at mid / last price</div>
+      ${QT.UNIVERSE[t.sym] && QT.UNIVERSE[t.sym].lot !== t.lot ? `<div class="warn">⚠ Entered with lot ${t.lot}; exchange lot is now ${QT.UNIVERSE[t.sym].lot}. Reset the paper account to re-size.</div>` : ''}
+      ${t.status === 'OPEN' && t.stale ? '<div class="warn">⚠ No fresh option price - P&L not updated, exits paused</div>' : t.status === 'OPEN' && t.est ? '<div class="warn">⚠ Option quote looks wrong (stale/empty book) - P&L shown is the model estimate, exits paused</div>' : ''}
+      ${t.sizeNote ? `<div class="sub">${esc(t.sizeNote)}</div>` : ''}
       ${t.status === 'OPEN' ? `<div class="sub">Exit ${num(t.exitTarget)} target / ${num(t.exitSL)} SL premium · 20-DMA ${num(t.ma20)}</div><div class="btns"><button class="btn sm red" data-act="exit" data-id="${t.id}">Exit position</button></div>` : ''}</div>`;
     }).join('') || '<div class="card sub">Nothing here.</div>';
     return h;
@@ -311,7 +355,7 @@
       <div class="sub">${t.id} · ${dmy(t.time)} ${hhmm(t.time)}${t.exitTime ? ' → ' + dmy(t.exitTime) + ' ' + hhmm(t.exitTime) : ''} · ${esc(t.stratName)} · conv ${t.conviction ?? '-'}</div>
       ${o ? `<div class="tk">${t.legs.map((l) => `${l.a === 'B' ? 'BUY ' : 'SELL'} ${l.K} ${l.t} @ ${num(l.fill)}${l.exitPx != null ? ' → ' + num(l.exitPx) : ''}`).join('<br>')}</div>
       <div class="grid"><div>Order<b>${t.orderId}</b></div><div>Dr/Cr<b>${t.net > 0 ? 'Debit' : 'Credit'}</b></div><div>Lots · Qty<b>${t.lots} · ${t.qty}</b></div><div>Entry spot<b>${num(t.entrySpot)}</b></div><div>Target / SL spot<b>${t.targetSpot ? num(t.targetSpot, 1) + ' / ' + num(t.slSpot, 1) : '-'}</b></div><div>Expiry · exit-by<b>${t.expiry.slice(5)} · ${t.exitBy.slice(5)}</b></div><div>Entry prem<b>${num(Math.abs(t.net))}</b></div><div>Target / SL prem<b>${num(t.exitTarget)} / ${num(t.exitSL)}</b></div><div>Profit@T / Loss@SL<b>${inr(t.profitAtTarget)} / ${inr(-t.lossAtSL)}</b></div><div>Gross<b class="${cls(t.pnlGross)}">${inr(t.pnlGross)}</b></div><div>Charges<b>${inr((t.chEntry || 0) + (t.chExit || 0))}</b></div><div>Origin<b>${t.origin}</b></div></div>
-      <div class="sub">Book rules: ${esc(t.details || '')}</div><div class="why">${esc(t.why || '')}</div>` : ''}</div>`;
+      <div class="sub">Sizing: ${esc(t.sizeNote || '-')}</div><div class="sub">Book rules: ${esc(t.details || '')}</div><div class="why">${esc(t.why || '')}</div>` : ''}</div>`;
     }).join('') || '<div class="card sub">No trades in the register yet.</div>';
     return h + `<div class="btns"><button class="btn sm ghost" data-act="reset">Reset paper account</button></div>`;
   }
@@ -350,6 +394,7 @@
       ['maxUtilPct', 'Max capital utilised in total (%)', 'pct'], ['dailyLossPct', 'Stop new orders after daily loss of (% of capital)', 'pct'], ['maxTradesPerDay', 'Max new trades per day', 'num'], ['maxOpen', 'Max open positions', 'num'], ['allowDup', 'Allow duplicate symbol', 'bool']]],
     ['Paper account & orders', [['autoTrade', 'Auto paper-trade triggered signals', 'bool'], ['minConviction', 'Min conviction to auto-trade', 'num'],
       ['charges', 'Apply brokerage & taxes', 'bool'], ['brokerage', 'Brokerage per order (₹)', 'num'], ['sttPct', 'STT on sell premium (%)', 'pct'], ['slipPct', 'Slippage on fills (%)', 'pct']]],
+    ['Safety filters (bad quotes)', [['quoteGuard', 'Reject entries whose option price is far from fair value', 'bool'], ['settleMin', 'No premium-based exits in first N minutes after 09:15', 'num'], ['exitConfirm', 'Premium target/stop must repeat on N consecutive refreshes', 'num']]],
     ['Profit booking', [['bookPct', 'Book profit at this % of target (any time market is open)', 'pct'], ['lockProfit', 'Trailing profit lock', 'bool'], ['lockAt', 'Lock arms once profit reaches (% of target)', 'pct'], ['lockKeep', 'Exit if profit falls back to (% of target)', 'pct']]],
     ['Strategy parameters (Settings sheet)', [['profitGoal', 'Profit goal per trade (₹) – workbook sizing', 'num'], ['vixThreshold', 'VIX threshold debit/credit', 'num'], ['targetPct', 'Underlying target (%)', 'pct'], ['slPct', 'Underlying stop-loss (%)', 'pct'],
       ['widthStock', 'Spread width – stocks (% of spot)', 'pct'], ['widthNifty', 'Spread width – Nifty (% of spot)', 'pct'], ['maxLots', 'Max lots per trade', 'num'], ['minEdge', 'Min agent edge (max 6)', 'num'], ['holdDays', 'Assumed days to reach target', 'num'], ['ivMult', 'Stock IV = VIX ×', 'num'], ['rf', 'Risk-free rate (%)', 'pct'], ['maxAge', 'Max data age counted as LIVE (sec)', 'num']]],
@@ -369,6 +414,7 @@
     let h = `<div class="card"><h4>Data feed (prices, candles, option chain)</h4>${field(['mode', 'Feed provider', 'ssel', [['demo', 'Demo (offline synthetic)'], ['live', 'Live – Upstox API'], ['custom', 'Custom JSON feed (your own adapter)']]])}
       ${S.mode === 'live' ? `<label>Upstox Analytics token (read-only)<input type="password" id="tok" data-k="token" value="${esc(S.token)}" placeholder="Paste Analytics token" autocomplete="off"></label>` : ''}
       ${S.mode === 'custom' ? field(['feedUrl', 'Custom feed base URL', 'text']) + field(['feedHeaders', 'Custom feed headers (JSON)', 'text']) : ''}
+      ${S.mode === 'live' ? field(['lotSync', 'Use exchange lot sizes from Upstox (recommended)', 'bool']) : ''}
       <label>Refresh every (sec)<input type="number" data-k="refreshSec" value="${S.refreshSec}"></label>
       <div class="btns"><button class="btn sm" data-act="test">Test connection</button>${S.mode === 'live' ? '<button class="btn sm ghost" data-act="showtok">Show/hide</button>' : ''}</div><div class="sub" id="testres"></div></div>
       <div class="card"><h4>Order execution (separate from the feed)</h4>
@@ -378,7 +424,8 @@
       ${S.orderBroker === 'upstox' ? field(['brokerToken', 'Upstox TRADING access token (not the Analytics token)', 'pass']) + field(['algoId', 'Algo ID / name (only if your broker requires it)', 'text']) : field(['webhookUrl', 'Order webhook URL', 'text']) + field(['webhookHeaders', 'Webhook headers (JSON)', 'text']) + field(['webhookBody', 'Webhook body template ({sym} {expiry} {strike} {type} {side} {qty} {lots} {price} {key} {ordertype} {product})', 'text'])}
       ${field(['dryRun', 'Dry run: log orders but DO NOT send', 'bool'])}${field(['product', 'Product', 'ssel', [['D', 'Delivery / NRML (positional)'], ['I', 'Intraday (MIS)']]])}${field(['orderType', 'Order type', 'ssel', [['LIMIT', 'LIMIT at paper-fill price'], ['MARKET', 'MARKET']]])}${field(['maxOrderValue', 'Max value per order (₹)', 'num'])}${field(['maxLiveOrdersDay', 'Max live orders per day', 'num'])}
       <div class="btns"><button class="btn sm red" data-act="paperonly">Stop live orders (Paper only)</button></div>` : ''}</div>
-      <div class="card"><h4>Trading time (IST) – new orders</h4><label>New orders allowed from<input type="time" data-k="tradeStart" value="${S.tradeStart}"></label><label>New orders allowed until<input type="time" data-k="tradeEnd" value="${S.tradeEnd}"></label>
+      <div class="card"><h4>Trading time (IST) – new orders</h4><div class="sub" style="margin-bottom:4px">Days when new orders are allowed</div><div class="days">${[1, 2, 3, 4, 5, 6, 0].map((d) => `<label class="dchip ${S.days.includes(d) ? 'on' : ''}"><input type="checkbox" data-day="${d}" ${S.days.includes(d) ? 'checked' : ''}> ${QT.dayName(d)}</label>`).join('')}</div>
+      <label>New orders allowed from<input type="time" data-k="tradeStart" value="${S.tradeStart}"></label><label>New orders allowed until<input type="time" data-k="tradeEnd" value="${S.tradeEnd}"></label>
       <label class="tg"><span>Demo mode ignores trading time</span><input type="checkbox" data-k="demoIgnoreHours" ${S.demoIgnoreHours ? 'checked' : ''}></label>
       <label class="tg"><span>Allow manual orders outside time</span><input type="checkbox" data-k="manualOutside" ${S.manualOutside ? 'checked' : ''}></label>
       <div class="sub">Weekdays only. New orders outside this window are not placed (manual ones are logged as REJECTED). Open positions are still monitored, and profit is booked or stops are hit, any time the market is open (09:15–15:30).</div></div>
@@ -454,6 +501,7 @@
     else if (a === 'ag') { A.ag = k; render(); } else if (a === 'df') { A.df = k; render(); } else if (a === 'more') { A.more = k; render(); }
     else if (a === 'tog') { A.open[k] = !A.open[k]; render(); }
     else if (a === 'hseg') { A.hseg = k; render(); }
+    else if (a === 'newsession') { if (confirm('Delete ALL old orders, trades and logs and start a fresh paper account?')) { QT.Paper.reset(S.capital); QT.Alerts.log = []; QT.Alerts.seen = {}; QT.Alerts.save(); QT.Run.clear(); A.tried = {}; toast('Fresh start: only new orders from now'); render(); } }
     else if (a === 'edu-ok') { S.eduAccepted = true; saveS(); nextModal(); }
     else if (a === 'modal-no') { nextModal(); }
     else if (a === 'ack-ok') { if (($('#ackin').value || '').trim().toUpperCase() === 'I UNDERSTAND') { S.liveAck = true; S.execMode = A.modal.want; S.dryRun = true; saveS(); nextModal(); toast('Broker mode enabled in DRY RUN. Switch Dry run off only when you are ready.'); render(); } else toast('Type I UNDERSTAND exactly'); }
@@ -470,6 +518,7 @@
       toast(res.ok ? `Order ${res.order.id} executed` : 'Rejected: ' + res.msg); A.sheet = null; render();
     }
     else if (a === 'exit') {
+      if (!QT.marketOpen() && !(S.mode === 'demo' && S.demoIgnoreHours)) return toast('Market is closed - exit when it opens (09:15-15:30)');
       const tr = QT.Paper.open().find((x) => x.id === t.dataset.id); let ch = A.chains[tr.sym + '|' + tr.expiry];
       if (!ch) { try { ch = await A.feed.chain(tr.sym, tr.expiry); } catch (er) {} }
       if (!ch) return toast('No option prices available');
@@ -497,6 +546,7 @@
   const later = () => { A.dirty = true; clearTimeout(rt); rt = setTimeout(() => refresh(), 800); };
   document.addEventListener('change', (e) => {
     const el = e.target;
+    if (el.dataset.day !== undefined) { const d = +el.dataset.day; S.days = el.checked ? [...new Set([...S.days, d])] : S.days.filter((x) => x !== d); saveS(); render(); return; }
     if (el.dataset.s) { S.strat[el.dataset.s] = el.checked; saveS(); later(); render(); return; }
     if (el.dataset.force !== undefined) { if (el.value) S.force[el.dataset.force] = +el.value; else delete S.force[el.dataset.force]; saveS(); later(); return; }
     if (el.dataset.ov !== undefined) { const v = parseFloat(el.value); if (v > 0) S.spotOv[el.dataset.ov] = v; else delete S.spotOv[el.dataset.ov]; saveS(); later(); return; }
@@ -523,5 +573,5 @@
   };
   QT.app = { S: () => S, A, refresh };
   setInterval(() => { if (!A.busy) paintHeader(); }, 5000);
-  document.addEventListener('DOMContentLoaded', () => { if (!S.eduAccepted) A.modal = { kind: 'edu' }; render(); schedule(); if (S.mode === 'demo' || S.token) refresh(); });
+  document.addEventListener('DOMContentLoaded', () => { if (freshStart) setTimeout(() => toast('New session: all old orders cleared'), 500); if (!S.eduAccepted) A.modal = { kind: 'edu' }; render(); schedule(); if (S.mode === 'demo' || S.token) refresh(); });
 })();

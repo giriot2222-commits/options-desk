@@ -2,6 +2,13 @@
 (function () {
   const QT = (globalThis.QT = globalThis.QT || {});
   const LS = () => (typeof localStorage !== 'undefined' ? localStorage : { getItem() {}, setItem() {} });
+  // Today's run log (what the app did today), cleared automatically each new day
+  const R = (QT.Run = {
+    log: [], day: '',
+    load() { try { const j = JSON.parse(LS().getItem('qt_run')); if (j && j.day === QT.istDate()) { R.log = j.log || []; R.day = j.day; } } catch (e) {} },
+    add(msg) { const d = QT.istDate(); if (R.day !== d) { R.day = d; R.log = []; } R.log.unshift({ t: new Date().toISOString(), msg }); if (R.log.length > 200) R.log.pop(); try { LS().setItem('qt_run', JSON.stringify({ day: R.day, log: R.log })); } catch (e) {} },
+    clear() { R.log = []; try { LS().setItem('qt_run', JSON.stringify({ day: QT.istDate(), log: [] })); } catch (e) {} },
+  });
   const A = (QT.Alerts = {
     log: [], seen: {},
     load() { try { const j = JSON.parse(LS().getItem('qt_alerts')); if (j) { A.log = j.log || []; A.seen = j.seen || {}; } } catch (e) {} },

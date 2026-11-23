@@ -3,7 +3,7 @@
   const QT = (globalThis.QT = globalThis.QT || {});
 
   QT.DEFAULTS = {
-    mode: 'demo', token: '', feedUrl: '', feedHeaders: '{}', refreshSec: 60, expiryMode: 'auto', maxAge: 120,
+    mode: 'demo', lotSync: true, token: '', feedUrl: '', feedHeaders: '{}', refreshSec: 60, expiryMode: 'auto', maxAge: 120,
     strat: { 1: true, 2: true, 3: false, 4: false, 5: false, 6: false, 7: true, 8: true, 9: true, 10: true },
     neutralTrade: true, maExit: true, force: {}, spotOv: {},
     // Settings sheet
@@ -27,7 +27,7 @@
     autoTune: false, optMinTrades: 20, optTargetWin: 0.55,
     charges: true, brokerage: 20, sttPct: 0.001, slipPct: 0.003,
     // trading time + closed-candle logic
-    tradeStart: '09:30', tradeEnd: '15:10', demoIgnoreHours: true, manualOutside: false, closedCandle: true, candleTf: 15, confirmN: 1, closeExit: true,
+    days: [1, 2, 3, 4, 5], settleMin: 10, exitConfirm: 2, quoteGuard: true, tradeStart: '09:30', tradeEnd: '15:10', demoIgnoreHours: true, manualOutside: false, closedCandle: true, candleTf: 15, confirmN: 1, closeExit: true,
     // alerts
     notify: true, alertMinConv: 50, tgToken: '', tgChat: '', theme: 'light', eduAccepted: false,
   };
@@ -94,7 +94,24 @@
   QT.istMin = () => { const d = QT.istNow(); return d.getUTCHours() * 60 + d.getUTCMinutes(); };
   QT.hm = (t) => { const [h, m] = String(t).split(':'); return +h * 60 + +m; };
   QT.isWeekday = () => { const w = QT.istNow().getUTCDay(); return w >= 1 && w <= 5; };
-  QT.inWindow = (S) => QT.isWeekday() && QT.istMin() >= QT.hm(S.tradeStart) && QT.istMin() <= QT.hm(S.tradeEnd);
+  QT.dayAllowed = (S) => (S.days || [1, 2, 3, 4, 5]).includes(QT.istNow().getUTCDay());
+  QT.inWindow = (S) => QT.isWeekday() && QT.dayAllowed(S) && QT.istMin() >= QT.hm(S.tradeStart) && QT.istMin() <= QT.hm(S.tradeEnd);
+  const DN = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  QT.dayName = (i) => DN[i];
+  // today's trading phase (IST) and the time to the next phase
+  QT.phase = (S) => {
+    const m = QT.istMin(), wd = QT.istNow().getUTCDay(), t0 = QT.hm(S.tradeStart), t1 = QT.hm(S.tradeEnd), sec = QT.istNow().getUTCSeconds();
+    const nxt = (to, label) => ({ label, secs: Math.max(0, (to - m) * 60 - sec) });
+    if (S.mode === 'demo' && S.demoIgnoreHours) return { key: 'demo', label: 'DEMO - trading time ignored', on: true, next: null };
+    if (!QT.isWeekday()) return { key: 'closed', label: `MARKET CLOSED (${DN[wd]})`, on: false, next: null };
+    if (!QT.dayAllowed(S)) return { key: 'dayoff', label: `${DN[wd]} not enabled for new orders`, on: false, next: m < 930 ? nxt(930, 'market closes') : null };
+    if (m < 540) return { key: 'pre', label: 'PRE-MARKET', on: false, next: nxt(555, 'market opens 09:15') };
+    if (m < 555) return { key: 'preopen', label: 'PRE-OPEN SESSION', on: false, next: nxt(555, 'market opens 09:15') };
+    if (m < t0) return { key: 'settle', label: 'MARKET OPEN - monitor only', on: false, next: nxt(t0, 'new orders start ' + S.tradeStart) };
+    if (m <= t1) return { key: 'window', label: 'TRADING WINDOW - new orders ON', on: true, next: nxt(t1 + 1, 'new orders stop ' + S.tradeEnd) };
+    if (m <= 930) return { key: 'exit', label: 'EXIT-ONLY - no new orders', on: false, next: nxt(931, 'market closes 15:30') };
+    return { key: 'closed', label: 'MARKET CLOSED', on: false, next: null };
+  };
   QT.canTrade = (S, src) => (S.mode === 'demo' && S.demoIgnoreHours) || (src === 'manual' && S.manualOutside) || QT.inWindow(S);
   QT.candleId = (tf) => { const t = Date.now() + 19800000 - 5000, day = Math.floor(t / 864e5), mins = (t % 864e5) / 60000 - 555; return day * 1000 + Math.floor(mins / tf); };
   QT.nextCloseSecs = (tf) => { const t = Date.now() + 19800000, mins = (t % 864e5) / 60000 - 555, nxt = (Math.floor(mins / tf) + 1) * tf; return Math.max(0, Math.round((nxt - mins) * 60)); };

@@ -33,15 +33,15 @@
       return r2(P.closed().filter((t) => t.exitTime && new Date(new Date(t.exitTime).getTime() + 19800000).toISOString().slice(0, 10) === d).reduce((x, t) => x + t.pnl, 0));
     },
     // money management: lots from risk budget (scaled by conviction) within margin caps - "AI" sizing; or the workbook's profit-goal lots
-    sizeLots(row, S) {
+    sizeInfo(row, S) {
       const eq = P.equity(S), lot = row.lot;
       const lossPerLot = Math.max(0.05, Math.abs(row.slPnl)) * lot, marginPerLot = Math.max(1, (row.debit ? row.net : row.maxLoss) * lot);
       const room = Math.min(eq * S.marginPerTradePct, eq * S.maxUtilPct - P.margin(), P.available(S));
-      const byMargin = Math.floor(room / marginPerLot);
-      if (S.sizing === 'workbook') return Math.max(0, Math.min(row.lots, byMargin));
-      const budget = eq * S.riskPct * (0.5 + (row.conviction || 50) / 100);
-      return Math.max(0, Math.min(Math.floor(budget / lossPerLot), byMargin, S.maxLots));
+      const byMargin = Math.floor(room / marginPerLot), budget = eq * S.riskPct * (0.5 + (row.conviction || 50) / 100), byRisk = Math.floor(budget / lossPerLot);
+      const lots = S.sizing === 'workbook' ? Math.max(0, Math.min(row.lots, byMargin)) : Math.max(0, Math.min(byRisk, byMargin, S.maxLots));
+      return { lots, byRisk, byMargin, wb: row.lots, budget: Math.round(budget), lossPerLot: Math.round(lossPerLot), mode: S.sizing };
     },
+    sizeLots(row, S) { return P.sizeInfo(row, S).lots; },
 
     // place an order (always logged). src: 'auto' | 'manual'
     enter(row, S, spots, src, meta) {
@@ -50,15 +50,19 @@
       const base = { sym: row.sym, stratName: row.stratName, src, lots: row.lots, qty: row.qty, expiry: row.expiry, conviction: row.conviction, signal: row.decision, candle: meta.candle || null,
         legs: row.legs.map((l) => ({ a: l.a, t: l.t, K: l.K, px: l.p })) };
       const reject = (reason) => { P.logOrder({ ...base, status: 'REJECTED', reason }); P.save(); return { ok: false, msg: reason }; };
-      if (!QT.canTrade(S, src)) return reject(`Outside trading time ${S.tradeStart}-${S.tradeEnd} IST`);
+      if (!QT.canTrade(S, src)) return reject(QT.isWeekday() && !QT.dayAllowed(S) ? `${QT.dayName(QT.istNow().getUTCDay())} is not enabled for new orders (Settings > Trading days)` : `Outside trading time ${S.tradeStart}-${S.tradeEnd} IST`);
       if (!S.allowDup && P.open().some((t) => t.sym === row.sym)) return reject('Position already open in ' + row.sym);
       if (P.open().length >= S.maxOpen) return reject('Max open positions (' + S.maxOpen + ') reached');
       const eq = P.equity(S), day = QT.istDate();
       if (P.st.trades.filter((t) => t.entryDay === day).length >= S.maxTradesPerDay) return reject('Max trades per day (' + S.maxTradesPerDay + ') reached');
       if (P.todayRealized() <= -eq * S.dailyLossPct) return reject(`Daily loss limit (${(S.dailyLossPct * 100).toFixed(1)}% of capital) reached - no new orders today`);
-      const lots = P.sizeLots(row, S);
+      const sz = P.sizeInfo(row, S), lots = sz.lots;
       if (lots < 1) return reject(`Capital limits: no room for 1 lot (free margin ${Math.round(P.available(S))}, utilisation cap ${(S.maxUtilPct * 100).toFixed(0)}%, per-trade cap ${(S.marginPerTradePct * 100).toFixed(0)}%, risk ${(S.riskPct * 100).toFixed(1)}%)`);
       const qty = lots * row.lot; base.lots = lots; base.qty = qty;
+      if (S.quoteGuard && row.legs.every((l) => l.src === 'LIVE')) {
+        const bad = row.legs.find((l) => Math.abs(l.p - l.model) > 0.6 * Math.max(l.model, 1));
+        if (bad) return reject(`Quote check: ${bad.t} ${bad.K} price ${bad.p} is far from fair value ${bad.model.toFixed(2)} (stale or empty order book) - order not placed`);
+      }
       const slip = S.slipPct;
       const legs = row.legs.map((l) => ({ a: l.a, t: l.t, K: l.K, key: l.key, fill: r2(l.a === 'B' ? l.p * (1 + slip) : l.p * (1 - slip)) }));
       const net = r2(legs.reduce((x, l) => x + (l.a === 'B' ? l.fill : -l.fill), 0));
@@ -73,7 +77,8 @@
         targetSpot: row.targetSpot, slSpot: row.slSpot, tpPnl: row.tpPnl, slPnl: row.slPnl, src: row.src, origin: src, candle: meta.candle || null,
         status: 'OPEN', pnlGross: 0, curSpot: spots[row.sym], val: net, why: row.verdict || '', ma20: meta.ma20 || null, range: row.range || null,
         exitTarget: row.exitTarget, exitSL: row.exitSL, profitAtTarget: Math.round(row.tpPnl * qty), lossAtSL: Math.round(-row.slPnl * qty), gate: row.gate, details: row.details, buyArea: row.buyArea,
-        targetTxt: row.targetTxt, slTxt: row.slTxt, plan: row.plan, entryDay: day, debit: row.debit, peak: 0,
+        targetTxt: row.targetTxt, slTxt: row.slTxt, plan: row.plan, entryDay: day, debit: row.debit, peak: 0, m0: row.legs.reduce((x, l) => x + (l.a === 'B' ? l.model : -l.model), 0), spot0: row.spot,
+        sizeNote: sz.mode === 'workbook' ? `Workbook sizing: ${sz.wb} lot(s) from profit goal, margin cap allows ${sz.byMargin}` : `AI sizing: risk budget ₹${sz.budget}, loss at SL ₹${sz.lossPerLot}/lot -> ${sz.byRisk} by risk, ${sz.byMargin} by margin; workbook goal lots ${sz.wb}`,
         ctx: { vix: meta.vix ?? null, edge: row.ag ? Math.abs(row.ag.edge) : null, streak: row.streak || 1, a2: row.a2 ? row.a2.score : null, conv1: row.conv1 ?? null, dte: row.dte, tf: S.candleTf, side: row.decision },
       };
       P.st.trades.unshift(t); P.save();
@@ -81,33 +86,60 @@
       return { ok: true, trade: t, order: o };
     },
 
+    // Mark price like a broker's MTM: mid when the spread is sane (<=25%), else last traded price; never a stale/empty bid
+    markPx(q) {
+      if (!q) return null;
+      const bid = q.bid || 0, ask = q.ask || 0, ltp = q.ltp || 0, mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : 0;
+      if (mid > 0 && (ask - bid) / mid <= 0.25) return mid;
+      if (ltp > 0) return ltp;
+      if (mid > 0) return mid;
+      return bid > 0 ? bid : ask > 0 ? ask : null;
+    },
+    // exit fill = mark -/+ half the spread, but never worse than max bid-ask / 2 (a junk quote cannot create a fake loss)
+    exitPx(q, side, S) {
+      const m = P.markPx(q), half = q.bid > 0 && q.ask > 0 ? (q.ask - q.bid) / 2 : 0, cap = m * (S.maxBA / 2), h = Math.min(half, cap);
+      return Math.max(0.05, side === 'B' ? m - h : m + h);
+    },
     value(t, chain) {
       let v = 0;
       for (const l of t.legs) {
-        const q = chain && chain.get(l.K) && chain.get(l.K)[l.t];
-        if (!q) return null;
-        const px = l.a === 'B' ? (q.bid > 0 ? q.bid : q.ltp) : q.ask > 0 ? q.ask : q.ltp;
-        v += l.a === 'B' ? px || 0 : -(px || 0);
+        const q = chain && chain.get(l.K) && chain.get(l.K)[l.t], m = P.markPx(q);
+        if (m == null) return null;
+        v += l.a === 'B' ? m : -m;
       }
       return v;
     },
 
+    // model (Black-Scholes) net value now, calibrated to the entry: used to spot stale / junk option quotes
+    expected(t, spot, S, vix, today) {
+      const iv = (vix / 100) * (t.sym === 'NIFTY' ? 1 : S.ivMult), T = Math.max(1, QT.daysBetween(today, t.expiry)) / 365;
+      const now = t.legs.reduce((x, l) => x + (l.a === 'B' ? 1 : -1) * QT.bs(l.t, spot, l.K, T, S.rf, iv), 0);
+      return t.net + (now - t.m0);
+    },
     // spots = live prices; sig = last CLOSED candle closes; ma20 = {sym: 20-DMA}
-    markAll(S, spots, chains, today, sig, ma20) {
-      const out = [];
-      const reasonTime = (S.mode === 'demo' && S.demoIgnoreHours) || QT.istMin() >= 915; // "closes" = near the daily close
+    markAll(S, spots, chains, today, sig, ma20, vix) {
+      const out = [], mins = QT.istMin();
+      const reasonTime = (S.mode === 'demo' && S.demoIgnoreHours) || mins >= 915; // "closes" = near the daily close
+      const settled = (S.mode === 'demo' && S.demoIgnoreHours) || mins >= 555 + (S.settleMin || 0);
+      const canExit = QT.marketOpen() || (S.mode === 'demo' && S.demoIgnoreHours);
       for (const t of P.open()) {
-        const ch = chains[t.sym + '|' + t.expiry], v = P.value(t, ch);
+        const ch = chains[t.sym + '|' + t.expiry];
+        let v = P.value(t, ch);
         if (spots[t.sym]) t.curSpot = spots[t.sym];
+        t.stale = v == null; t.est = false;
+        if (v != null && vix && t.m0 != null) { // quote sanity: a position cannot lose/gain far more than the model implies
+          const exp = P.expected(t, t.curSpot, S, vix, today);
+          if (Math.abs(v - exp) > 0.35 * Math.abs(t.net) + 0.5) { t.est = true; v = exp; } // junk quote -> show the model estimate, do not trade on it
+        }
         if (v != null) { t.val = r2(v); t.pnlGross = r2((v - t.net) * t.qty); }
         const sp = S.closeExit && sig && sig[t.sym] ? sig[t.sym] : t.curSpot;
-        const pps = t.val - t.net;
-        let why = null;
-        if (v != null) {
+        const pps = t.val - t.net, ok = v != null && !t.est;
+        let why = null, premium = false;
+        if (ok) {
           t.peak = Math.max(t.peak || 0, pps);
-          if (pps >= t.tpPnl * (S.bookPct || 1)) why = 'TARGET HIT'; // profit is booked any time the market is open
-          else if (pps <= t.slPnl) why = 'SL HIT';
-          else if (S.lockProfit && t.peak >= t.tpPnl * S.lockAt && pps <= t.tpPnl * S.lockKeep) why = 'PROFIT LOCK';
+          if (pps >= t.tpPnl * (S.bookPct || 1)) { why = 'TARGET HIT'; premium = true; } // profit is booked any time the market is open
+          else if (pps <= t.slPnl) { why = 'SL HIT'; premium = true; }
+          else if (S.lockProfit && t.peak >= t.tpPnl * S.lockAt && pps <= t.tpPnl * S.lockKeep) { why = 'PROFIT LOCK'; premium = true; }
         }
         if (!why && t.targetSpot) {
           if (t.bias === 'U') why = sp >= t.targetSpot ? 'TARGET HIT' : sp <= t.slSpot ? 'SL HIT' : null;
@@ -120,14 +152,16 @@
           else if (t.bias === 'D' && m && c > m) why = 'ENTRY REASON GONE';
           else if (t.range && (c < t.range[0] || c > t.range[1])) why = 'ENTRY REASON GONE';
         }
-        // straddle / strangle: "exit if still flat at 1/2 time"
-        if (!why && t.bias === 'N' && !t.range) {
+        if (!why && t.bias === 'N' && !t.range) { // straddle / strangle: "exit if still flat at 1/2 time"
           const tot = QT.daysBetween(t.entryDay || today, t.exitBy), el = QT.daysBetween(t.entryDay || today, today);
           if (tot > 0 && el >= tot / 2 && Math.abs(t.curSpot / t.entrySpot - 1) < S.targetPct / 2) why = 'FLAT AT 1/2 TIME';
         }
         if (!why && today >= t.exitBy) why = 'EXIT-BY DUE';
         if (!why && today >= t.expiry) why = 'EXPIRED';
-        if (why && v != null && (QT.marketOpen() || (S.mode === 'demo' && S.demoIgnoreHours))) { P.close(t, why, S, ch); out.push(t); }
+        // premium-based exits: not in the opening-settle minutes, and must repeat on N consecutive marks (filters bad ticks)
+        if (why && premium) { t.hit = (t.hitWhy === why ? (t.hit || 0) : 0) + 1; t.hitWhy = why; if (!settled || t.hit < (S.exitConfirm || 1)) why = null; }
+        else if (!why || !premium) { if (!premium) { t.hit = 0; t.hitWhy = null; } }
+        if (why && ok && canExit) { P.close(t, why, S, ch); out.push(t); }
       }
       P.st.curve.push([Date.now(), P.equity(S)]); if (P.st.curve.length > 600) P.st.curve.shift();
       P.save();
@@ -136,8 +170,7 @@
 
     close(t, why, S, chain) {
       const fills = t.legs.map((l) => {
-        const q = chain.get(l.K)[l.t];
-        const px = l.a === 'B' ? (q.bid > 0 ? q.bid : q.ltp) : q.ask > 0 ? q.ask : q.ltp;
+        const q = chain.get(l.K)[l.t], px = P.exitPx(q, l.a, S);
         l.exitPx = r2(Math.max(0.05, l.a === 'B' ? px * (1 - S.slipPct) : px * (1 + S.slipPct)));
         return { side: l.a === 'B' ? 'S' : 'B', price: l.exitPx, qty: t.qty };
       });
