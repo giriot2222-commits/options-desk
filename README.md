@@ -1,4 +1,4 @@
-# Options Desk v4 – broker-style options paper-trading app (EDUCATIONAL PURPOSE ONLY)
+# Options Desk v6 – broker-style options paper-trading app (EDUCATIONAL PURPOSE ONLY)
 
 Not investment advice. Paper trading by default. SEBI studies found most individual F&O traders lose money.
 
@@ -30,3 +30,12 @@ Push this folder to GitHub (`main`). The workflow builds the app and publishes `
 
 ## Limits
 No tick data; app works while open; trend signals ignore news/results; lot sizes / holidays approximate; email alerts unavailable (Telegram + phone notifications).
+
+## v6 - strict book mode (default)
+- Verified against the workbook's own computed values for all 51 symbols with ZERO tolerance (see AUDIT_app_vs_workbook.csv):
+  strategy #, lots, qty, net premium, exit premiums, profit/loss, capital, decision. Strategy identification is checked on 315 trend/VIX/day-move combinations.
+- Lots = ROUNDUP(profit goal / (lot x profit per share)), capped by max lots - never resized. If margin is short the order is rejected.
+- Lot size source: book list (default) or exchange lot from Upstox; differences are reported (Settings > Check lot sizes now) and block real broker orders.
+- Strikes are the real listed strikes from the option chain (ATM = nearest listed strike).
+- Every measurable book rule is a hard FAIL in strict mode (liquidity, bid-ask, OI verification, trend/support, consolidation, expiry).
+- Excel-exact rounding and a double-precision normal CDF so every rupee matches the sheet.

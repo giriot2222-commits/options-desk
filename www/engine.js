@@ -16,7 +16,7 @@
     // money management ("AI" sizing = risk-based lots within utilisation caps)
     sizing: 'workbook', riskPct: 0.015, marginPerTradePct: 0.1, maxUtilPct: 0.9, dailyLossPct: 0.03, maxTradesPerDay: 20,
     // profit booking (works any time the market is open, even outside the new-order window)
-    exitOnPremiumTarget: true, reentryLock: 'target', bookPct: 1, lockProfit: true, lockAt: 0.7, lockKeep: 0.4,
+    fillMode: 'ltp', targetBasis: 'premium', slBasis: 'premium', targetConfirm: 1, slConfirm: 2, reentryLock: 'target', bookPct: 1, lockProfit: false, lockAt: 0.7, lockKeep: 0.4,
     // Agent 2 (history & movement) + Judge
     a2Enabled: true, a2Strict: 'normal', a2Weight: 0.4,
     // broker execution (separate from the data feed)
@@ -246,7 +246,7 @@
         const px = a === 'B' ? (q.ask > 0 ? q.ask : q.ltp) : q.bid > 0 ? q.bid : q.ltp;
         if (px > 0) { p = px; src = 'LIVE'; oi = q.oi / lot; key = q.key; ba = q.ask > 0 && q.bid > 0 ? (q.ask - q.bid) / ((q.ask + q.bid) / 2) : null; }
       }
-      return { a, t, K, p: tick(p), model, src, oi, ba, key };
+      return { a, t, K, p: tick(p), model, src, oi, ba, key, q: q ? { bid: q.bid, ask: q.ask, ltp: q.ltp } : null };
     });
     const sg = (l) => (l.a === 'B' ? 1 : -1);
     const net = r2(legs.reduce((s, l) => s + sg(l) * l.p, 0)), debit = net > 0;

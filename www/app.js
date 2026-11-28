@@ -12,6 +12,7 @@
   let S = { ...QT.DEFAULTS, strat: { ...QT.DEFAULTS.strat }, favs: [], force: {}, spotOv: {}, tuneLog: [], lastTuneN: 0 };
   try { const j = JSON.parse(localStorage.getItem('qt_cfg4')); if (j) S = { ...S, ...j, strat: { ...S.strat, ...(j.strat || {}) }, force: j.force || {}, spotOv: j.spotOv || {}, tuneLog: j.tuneLog || [] }; } catch (e) {}
   const saveS = () => localStorage.setItem('qt_cfg4', JSON.stringify(S));
+  if ((S.cfgVer || 0) < 7) { S.targetBasis = S.exitOnPremiumTarget === false ? 'spot' : 'premium'; S.slBasis = 'premium'; S.targetConfirm = 1; S.slConfirm = 2; S.lockProfit = false; S.cfgVer = 7; saveS(); }
   if ((S.cfgVer || 0) < 6) { S.sizing = 'workbook'; S.strictBook = true; S.lotSource = 'book'; S.cfgVer = 6; saveS(); }
   QT.Paper.load(); QT.Alerts.load(); QT.Run.load();
   let freshStart = false;
@@ -141,7 +142,7 @@
       if (!tr.pass) { QT.Paper.logOrder({ sym: row.sym, stratName: row.stratName, src, lots: row.lots, qty: row.qty, expiry: row.expiry, signal: row.decision, status: 'REJECTED', reason: 'Book rules failed at execution: ' + tr.details, legs: [] }); QT.Paper.save(); return { ok: false, msg: 'Rules failed at execution' }; }
       r = { ...row, ...tr };
     }
-    return QT.Paper.enter(r, S, A.snap.quotes, src, { candle: A.sigTs[row.sym], ma20: A.ind[row.sym].ma20, vix: A.snap.vix });
+    return QT.Paper.enter(r, S, A.snap.quotes, src, { candle: A.sigTs[row.sym], candleClose: A.sig && A.sig[row.sym], ma20: A.ind[row.sym].ma20, vix: A.snap.vix, sigRow: row });
   }
   function schedule() {
     clearInterval(A.timer);
@@ -189,9 +190,31 @@
 
   // ---------- helpers for views ----------
   function chgOf(sym) { const q = A.snap && A.snap.quotes[sym], p = A.ind[sym] && A.ind[sym].prevClose; return q && p ? { ltp: q, pct: (q / p - 1) * 100 } : { ltp: q, pct: 0 }; }
+  const legHtml = (a, K, ty, px, pre) => `<span class="${ty === 'CE' ? 'ce' : 'pe'}">${pre ? pre + ' ' : ''}${a === 'B' ? 'BUY ' : 'SELL'} ${K} ${ty}${px != null ? ' @ ' + num(px) : ''}</span>`;
+  const sideChips = (legs) => [...new Set(legs.map((l) => `${l.a === 'B' ? 'BUY' : 'SELL'} ${l.t}`))].map((x) => `<span class="chip ${x.endsWith('CE') ? 'CE' : 'PE'}">${x}</span>`).join(' ');
+  const candleLine = (o) => (o.candle ? `<div class="sub">Closed ${o.tf || S.candleTf}m candle ${hhmm(o.candle)}${o.candleClose != null ? ' · close ' + num(o.candleClose) : ''}</div>` : '');
   const chip = (t, c) => `<span class="chip ${c || t}">${esc(t)}</span>`;
   const dec = (r) => (r.decision === 'NO DATA' ? 'NODATA' : r.decision);
 
+  // why a triggered signal has / has not become an order (same checks, same order as the auto-trade loop)
+  function whyOrder(r) {
+    const P = QT.Paper, day = QT.istDate(), isT = (iso) => iso && new Date(new Date(iso).getTime() + 19800000).toISOString().slice(0, 10) === day;
+    const op = P.open().find((t) => t.sym === r.sym);
+    if (op) return { st: 'ORDERED', msg: `Order placed: ${op.id} (one symbol - one order)` };
+    const lk = P.lockedFor(r, S); if (lk) return { st: 'LOCKED', msg: `Re-entry locked after ${lk.why}; waits for a trend reversal` };
+    if (!S.autoTrade) return { st: 'MANUAL', msg: 'Auto-trade is OFF - place the order yourself' };
+    if (!QT.canTrade(S, 'auto')) return { st: 'WAIT', msg: 'Not order time: ' + QT.phase(S).label };
+    if (r.conviction < S.minConviction) return { st: 'BELOW', msg: `Conviction ${r.conviction} is below the minimum ${S.minConviction}` };
+    if ((r.streak || 1) < S.confirmN) return { st: 'WAIT', msg: `Waiting for candle confirmation ${r.streak || 1}/${S.confirmN}` };
+    if (P.open().length >= S.maxOpen) return { st: 'BLOCKED', msg: `Max open positions (${S.maxOpen}) reached` };
+    if (P.st.trades.filter((t) => t.entryDay === day).length >= S.maxTradesPerDay) return { st: 'BLOCKED', msg: `Max trades per day (${S.maxTradesPerDay}) reached` };
+    if (P.todayRealized() <= -P.equity(S) * S.dailyLossPct) return { st: 'BLOCKED', msg: 'Daily loss limit reached' };
+    const sz = P.sizeInfo(r, S); if (sz.lots < 1) return { st: 'BLOCKED', msg: `Capital: book lots ${sz.wb} need margin ${sz.need}, allowed less - lots are never reduced` };
+    const rej = P.st.orders.find((o) => o.sym === r.sym && o.status === 'REJECTED' && isT(o.time));
+    if (rej) return { st: 'REJECTED', msg: 'Last order rejected: ' + rej.reason };
+    return { st: 'READY', msg: 'Order will be placed on the next refresh' };
+  }
+  const wchip = (w) => `<span class="chip ${w.st === 'ORDERED' ? 'BUY' : w.st === 'READY' || w.st === 'WAIT' ? 'AUTO' : 'SELL'}">${w.st}</span>`;
   // ---------- Watchlist ----------
   function watch() {
     if (!A.snap) return `<div class="card">${A.busy ? 'Loading market data…' : 'Tap ↻ to load.'}<div class="sub">Demo mode works offline. For real prices add your Upstox token in More → Settings.</div></div>`;
@@ -211,7 +234,7 @@
   function wlist(list) {
     return list.map((s) => {
       const c = chgOf(s), r = A.all[s], trig = isTrig(r);
-      const sub = trig ? `${esc(r.stratName)} · conv ${r.conviction}${S.confirmN > 1 ? ` · ${r.streak}/${S.confirmN} candles` : ''}` : r ? esc((r.reason || '').slice(0, 44)) : '';
+      const sub = trig ? `${esc(r.stratName)} · conv ${r.conviction} · ${esc(whyOrder(r).msg)}` : r ? esc((r.reason || '').slice(0, 44)) : '';
       return `<div class="wr" data-act="sheet" data-s="${s}"><div><b>${S.favs.includes(s) ? '★ ' : ''}${QT.Paper.st.locks && QT.Paper.st.locks[s] ? '🔒 ' : ''}${s}</b> ${trig ? chip(r.decision) : ''}<span class="sub">${sub}</span></div><div class="rt"><b>${c.ltp ? num(c.ltp) : '-'}</b><span class="${cls(c.pct)}">${c.pct >= 0 ? '+' : ''}${c.pct.toFixed(2)}%</span></div></div>`;
     }).join('') || `<div class="card sub">${A.wl === 'fav' ? 'No favourites yet. Open a symbol and tap ★.' : A.wl === 'sig' ? 'No triggered signals on the last closed candle.' : 'No match'}</div>`;
   }
@@ -235,7 +258,7 @@
   function sheet(sym) {
     const c = chgOf(sym), ind = A.ind[sym] || {}, r = A.all[sym], trig = isTrig(r), u = QT.UNIVERSE[sym];
     let h = `<div class="row"><span class="big">${sym}</span><span class="sp"></span><button class="star" data-act="fav" data-s="${sym}">${S.favs.includes(sym) ? '★' : '☆'}</button><button class="btn sm ghost" data-act="close-sheet">✕</button></div>
-      <div class="row"><span class="big">${num(c.ltp)}</span><span class="${cls(c.pct)}">${c.pct >= 0 ? '+' : ''}${c.pct.toFixed(2)}%</span></div>
+      <div class="row">${r && r.legs ? sideChips(r.legs) : ''}<span class="big">${num(c.ltp)}</span><span class="${cls(c.pct)}">${c.pct >= 0 ? '+' : ''}${c.pct.toFixed(2)}%</span></div>
       <div class="grid"><div>Prev close<b>${num(ind.prevClose)}</b></div><div>~20-DMA<b>${num(ind.ma20)}</b></div><div>~50-DMA<b>${num(ind.ma50)}</b></div><div>52W high / low<b>${num(ind.hi52, 0)} / ${num(ind.lo52, 0)}</b></div><div>60d high / low<b>${num(ind.hi60, 0)} / ${num(ind.lo60, 0)}</b></div><div>Lot (${u.live ? 'exchange' : 'book'}) · avg vol<b>${u.lot} · ${ind.avgVol ? Math.round(ind.avgVol / 1000) + 'k' : '-'}</b>${u.exch && u.exch !== u.lot ? `<span class="warn">⚠ exchange ${u.exch}</span>` : ''}</div></div>
       <div class="sub">Closed ${S.candleTf}m candle: <b>${A.sig && A.sig[sym] ? num(A.sig[sym]) : '-'}</b>${A.sigTs[sym] ? ' @ ' + hhmm(A.sigTs[sym]) : ''} · agents use this close, not the live tick</div>`;
     if (!r) return h;
@@ -245,10 +268,11 @@
     if (r.a2) h += `<div class="card"><h4>Agent 2 · history &amp; movement</h4><div class="row">${chip(r.a2.opinion, r.a2.opinion === 'SUPPORT' ? 'PASS' : r.a2.opinion === 'OPPOSE' ? 'FAIL' : 'WARN')}<b>${r.a2.score >= 0 ? '+' : ''}${r.a2.score}/${r.a2.n}</b><span class="sub">(${r.a2.support} support · ${r.a2.oppose} oppose · min ${r.a2.min})</span></div>${r.a2.checks.map((x) => `<div class="rule"><span>${esc(x.name)}<div class="n">${esc(x.note)}</div></span>${chip(x.vote > 0 ? '+1' : x.vote < 0 ? '-1' : '0', x.vote > 0 ? 'PASS' : x.vote < 0 ? 'FAIL' : 'IGNORE')}</div>`).join('')}</div>`;
     else if (r.candidate && S.a2Enabled === false) h += '<div class="card sub">Agent 2 is switched off in Settings.</div>';
     else h += '<div class="card sub">Agent 2 runs only after Agent 1 (book) triggers and the book rules pass.</div>';
+    if (trig) { const w = whyOrder(r); h += `<div class="card"><h4>Signal → order</h4><div class="row">${wchip(w)}<span>${esc(w.msg)}</span></div><div class="sub" style="margin-top:6px">Signal uses the last CLOSED ${S.candleTf}m candle and the book lots. The order is re-priced on the live option chain at the moment it is placed, so strike, price and lots can differ slightly (see the position card).</div></div>`; }
     h += `<div class="card"><div class="row"><b>JUDGE</b>${chip(r.decision === 'NO DATA' ? 'NO DATA' : r.decision, dec(r))}${trig ? chip('Conviction ' + r.conviction + (r.conv1 != null && r.a2 ? ` (A1 ${r.conv1} · A2 ${r.a2.conv2})` : ''), 'IGNORE') : ''}</div><div class="why">${esc(r.verdict || r.reason || '')}</div>
       <pre class="tx" id="txt-${sym}">${esc(transcript(r))}</pre><div class="btns"><button class="btn sm ghost" data-act="copytx" data-s="${sym}">Copy text</button></div></div>`;
     if (r.ticket) {
-      h += `<div class="card"><h4>Trade planner · ${esc(r.stratName)} <span class="sub">(#${r.strat}${r.forced ? ' forced' : ''} · ${esc(r.view)})</span></h4><div class="tk">${r.ticket.map(esc).join('<br>')}</div>
+      h += `<div class="card"><h4>Trade planner · ${esc(r.stratName)} <span class="sub">(#${r.strat}${r.forced ? ' forced' : ''} · ${esc(r.view)})</span></h4><div class="tk">${r.legs.map((l) => legHtml(l.a, l.K, l.t, l.p, `${r.lots}L ${r.sym} ${QT.ddmmm(r.expiry)}`)).join('<br>')}</div>
       <div class="grid"><div>Lots · Qty<b>${r.lots} · ${r.qty}</b></div><div>Net prem/share<b>${num(Math.abs(r.net))} ${r.debit ? 'Dr' : 'Cr'}</b></div><div>Capital needed<b>${inr(r.capital)}</b></div><div>Exit @ target<b>${num(r.exitTarget)}</b></div><div>Exit @ SL<b>${num(r.exitSL)}</b></div><div>Max loss<b>${inr(r.maxLoss * r.qty)}</b></div><div>Profit @ target<b class="pos">${inr(r.profitAtTarget)}</b></div><div>Loss @ SL<b class="neg">${inr(-r.lossAtSL)}</b></div><div>Expiry · DTE<b>${r.expiry.slice(5)} · ${r.dte}d</b></div></div>
       <div class="kv">Buying area <b>${r.buyArea}</b></div><div class="kv">Underlying target / range <b>${esc(r.targetTxt)}</b></div><div class="kv">Underlying SL / exit rule <b>${esc(r.slTxt)}</b></div><div class="kv">Exit-by <b>${r.exitBy}</b> · Price source <b>${esc(r.src)}</b></div><div class="why"><b>TRADING PLAN</b> ${esc(r.plan)}</div>${ruleTable(r)}</div>`;
     }
@@ -270,6 +294,7 @@
       const list = A.order.filter((r) => A.df === 'all' || r.decision === A.df).sort((a, b) => (b.conviction || -1) - (a.conviction || -1));
       h += list.map((r) => `<div class="card" data-act="sheet" data-s="${r.sym}"><div class="row"><b>${r.sym}</b>${chip(r.decision === 'NO DATA' ? 'NO DATA' : r.decision, dec(r))}${r.conviction ? chip('Conv ' + r.conviction, 'IGNORE') : ''}<span class="sp"></span>₹${num(r.spot)}</div>
         ${r.ag ? dots(r.ag) + `<div class="sub">Agent 1: Bull ${r.ag.bull} · Bear ${r.ag.bear} · edge ${r.ag.edge > 0 ? '+' : ''}${r.ag.edge} · bias ${r.bias} · ${esc(r.stratName)} · rules ${esc(r.gate || '-')}</div>${r.a2 ? `<div class="sub">Agent 2: ${r.a2.opinion} ${r.a2.score >= 0 ? '+' : ''}${r.a2.score}/${r.a2.n}</div>` : ''}` : ''}
+        ${['BUY', 'SELL', 'NEUTRAL'].includes(r.decision) ? `<div class="sub">${wchip(whyOrder(r))} ${esc(whyOrder(r).msg)}</div>` : ''}
         <div class="why">${esc(r.verdict || r.reason || '')}</div></div>`).join('') || '<div class="card sub">None.</div>';
       return h;
     }
@@ -296,9 +321,9 @@
   function orders() {
     const all = QT.Paper.st.orders, list = all.filter((o) => A.ord === 'all' || (A.ord === 'done' ? o.status === 'COMPLETE' : o.status === 'REJECTED'));
     let h = `<div class="seg">${[['all', 'All ' + all.length], ['done', 'Executed'], ['rej', 'Rejected']].map(([k, l]) => `<button class="${A.ord === k ? 'on' : ''}" data-act="ord" data-k="${k}">${l}</button>`).join('')}</div>`;
-    h += list.map((o) => `<div class="card"><div class="row"><b>${o.sym}</b><span class="chip ${o.src === 'manual' ? 'MANUAL' : o.signal === 'EXIT' ? 'EXIT' : 'AUTO'}">${o.signal === 'EXIT' ? 'EXIT' : o.src.toUpperCase()}</span><span class="sp"></span><span class="chip ${o.status}">${o.status}</span></div>
-      <div class="sub">${dmy(o.time)} ${hhmm(o.time)} · ${o.id} · ${esc(o.stratName)} · ${o.lots}L${o.candle ? ' · candle ' + hhmm(o.candle) : ''}</div>
-      ${o.legs && o.legs.length ? `<div class="tk">${o.legs.map((l) => `${l.a === 'B' ? 'BUY ' : 'SELL'} ${o.expiry} ${l.K} ${l.t} @ ${num(l.px)}`).join('<br>')}</div>` : ''}
+    h += list.map((o) => `<div class="card"><div class="row"><b>${o.sym}</b><span class="chip ${o.src === 'manual' ? 'MANUAL' : o.signal === 'EXIT' ? 'EXIT' : 'AUTO'}">${o.signal === 'EXIT' ? 'EXIT' : o.src.toUpperCase()}</span>${o.legs && o.legs.length ? sideChips(o.legs) : ''}<span class="sp"></span><span class="chip ${o.status}">${o.status}</span></div>
+      <div class="sub">${dmy(o.time)} ${hhmm(o.time)} · ${o.id} · ${esc(o.stratName)} · ${o.lots}L</div>${candleLine(o)}
+      ${o.legs && o.legs.length ? `<div class="tk">${o.legs.map((l) => legHtml(l.a, l.K, l.t, l.px, o.expiry)).join('<br>')}</div>` : ''}
       ${o.reason ? `<div class="${o.status === 'REJECTED' ? 'neg' : 'sub'}">${esc(o.reason)}</div>` : ''}</div>`).join('') || '<div class="card sub">No orders yet. Orders from triggered signals appear here with their status.</div>';
     return h;
   }
@@ -327,21 +352,41 @@
     h += `<div class="card"><h4>Today's run</h4>${lg.map((x) => `<div class="kv"><b>${hhmm(x.t)}</b> ${esc(x.msg)}</div>`).join('') || '<div class="sub">Nothing yet today.</div>'}</div>`;
     return h;
   }
+  // exit rules in force for a position (information only - the engine exits per Settings)
+  const BASIS = { premium: 'option premium', spot: 'underlying price', either: 'either', both: 'both' };
+  function exitInfo(t) {
+    const v = t.verify || {}, tb = v.tb || S.targetBasis, sb = v.sb || S.slBasis, dir = t.debit ? '≥' : '≤', sdir = t.debit ? '≤' : '≥', ok = (x) => (x ? '<b class="pos">✓ met</b>' : '<span class="sub">not yet</span>');
+    const tgS = t.targetSpot ? `${t.bias === 'U' ? '≥' : '≤'} ${num(t.targetSpot)}` : '-', slS = t.slSpot ? `${t.bias === 'U' ? '≤' : '≥'} ${num(t.slSpot)}` : '-';
+    return `<div class="why" style="margin-top:6px"><b>Exit rules (set in Settings, as per book)</b><br>
+      Option now <b>${num(v.premNow ?? Math.abs(t.val))}</b>${v.est ? ' <span class="warn">(estimate - quote looks wrong)</span>' : ''}${v.stale ? ' <span class="warn">(no fresh price)</span>' : ''}<br>
+      TARGET on ${BASIS[tb]}${tb === 'both' ? ' (both must hold)' : ''}: premium ${dir} ${num(t.exitTarget)} ${ok(v.premT)} · underlying ${tgS} ${t.targetSpot ? ok(v.spT) : ''} · verified ${v.tN || 0}/${v.tc || S.targetConfirm}<br>
+      STOP on ${BASIS[sb]}${sb === 'both' ? ' (both must hold)' : ''}: premium ${sdir} ${num(t.exitSL)} ${ok(v.premS)} · underlying ${slS} ${t.slSpot ? ok(v.spS) : ''} · verified ${v.sN || 0}/${v.sc || S.slConfirm}<br>
+      Exit-by <b>${t.exitBy}</b>${t.bias === 'U' ? ` · exit if spot closes below 20-DMA ${num(t.ma20)}` : t.bias === 'D' ? ` · exit if spot closes above 20-DMA ${num(t.ma20)}` : t.range ? ` · exit if spot leaves ${num(t.range[0], 0)}-${num(t.range[1], 0)}` : ' · exit if still flat at half time'}</div>`;
+  }
+  // what changed between the signal and the order that was actually filled
+  function sigVsOrder(t) {
+    const g = t.sigSnap; if (!g) return '';
+    const sg = g.legs.map((l) => `${l.a === 'B' ? 'B' : 'S'} ${l.K}${l.t} @${num(l.p)}`).join(' / '), od = t.legs.map((l) => `${l.a === 'B' ? 'B' : 'S'} ${l.K}${l.t} @${num(l.fill)}`).join(' / ');
+    const fl = [];
+    if (g.legs.some((l, i) => t.legs[i] && l.K !== t.legs[i].K)) fl.push('strike changed (order re-priced on the live option chain, spot moved)');
+    if (g.lots !== t.lots) fl.push(`lots ${g.lots} → ${t.lots} (book formula re-run at the new price)`);
+    const slip = t.legs.map((l, i) => (g.legs[i] ? l.fill - g.legs[i].p : 0)).reduce((x, y) => x + Math.abs(y), 0);
+    if (slip > 0.001) fl.push('fill follows the Entry fill setting (' + (S.fillMode === 'ltp' ? 'last traded price' : 'ask/bid') + ') on a fresher quote');
+    if (g.spot && t.entrySpot && Math.abs(g.spot / t.entrySpot - 1) > 0.0005) fl.push(`spot ${num(g.spot)} (signal) → ${num(t.entrySpot)} (order)`);
+    return `<div class="sub"><b>Signal</b> ${esc(sg)} · ${g.lots}L · spot ${num(g.spot)}<br><b>Order</b> ${esc(od)} · ${t.lots}L · spot ${num(t.entrySpot)}${fl.length ? '<br><span class="warn">' + esc(fl.join('; ')) + '</span>' : '<br><span class="ok">identical to the signal</span>'}</div>`;
+  }
   function positions() {
     const P = QT.Paper, list = A.pos === 'open' ? P.open() : P.closed();
     let h = todayPanel() + fundsTiles() + `<div class="seg">${[['open', 'Open ' + P.open().length], ['closed', 'Closed ' + P.closed().length]].map(([k, l]) => `<button class="${A.pos === k ? 'on' : ''}" data-act="pos" data-k="${k}">${l}</button>`).join('')}</div>`;
     h += list.map((t) => {
-      const pnl = t.status === 'OPEN' ? (t.pnlGross || 0) - t.chEntry : t.pnl;
-      return `<div class="card"><div class="row"><b>${t.sym}</b><span class="chip">${esc(t.stratName)}</span><span class="sp"></span><b class="${cls(pnl)}">${inr(pnl)}</b></div>
+      const pnl = t.status === 'OPEN' ? t.pnlGross || 0 : t.pnl;
+      return `<div class="card"><div class="row"><b>${t.sym}</b>${sideChips(t.legs.map((l) => ({ a: l.a, t: l.t })))}<span class="chip">${esc(t.stratName)}</span><span class="sp"></span><b class="${cls(pnl)}">${inr(pnl)}</b></div>${t.status === 'OPEN' ? `<div class="sub" style="text-align:right">after entry charges ${inr((t.pnlGross || 0) - t.chEntry)}</div>` : ''}
       <div class="sub">${t.id} · ${t.lots}L (${t.qty}) · exp ${t.expiry} · ${t.status === 'OPEN' ? 'exit by ' + t.exitBy : t.status}</div>
-      <div class="tk">${t.legs.map((l) => `${l.a === 'B' ? 'BUY ' : 'SELL'} ${l.K} ${l.t} @ ${num(l.fill)}${l.exitPx != null ? ' → ' + num(l.exitPx) : ''}`).join('<br>')}</div>
+      ${candleLine(t)}<div class="tk">${t.legs.map((l) => legHtml(l.a, l.K, l.t, l.fill) + (l.exitPx != null ? ' → ' + num(l.exitPx) : '')).join('<br>')}</div>
       <div class="sub">Spot ${num(t.entrySpot)} → ${num(t.status === 'OPEN' ? t.curSpot : t.exitSpot)}${t.targetSpot ? ` · T ${num(t.targetSpot)} · SL ${num(t.slSpot)}` : t.targetTxt ? ' · ' + esc(t.targetTxt) : ''} · margin ${inr(t.margin)}</div>
-      ${t.status === 'OPEN' ? `<div class="sub">Option now <b>${num(Math.abs(t.val))}</b> → target <b class="pos">${num(t.exitTarget)}</b> · stop <b class="neg">${num(t.exitSL)}</b> (exits on the option target, not only the spot target)</div>` : ''}
-      <div class="sub">Profit at target <b class="pos">${inr(t.profitAtTarget)}</b> · Loss at SL <b class="neg">${inr(-t.lossAtSL)}</b> · P&L is marked at mid / last price</div>
-      ${QT.UNIVERSE[t.sym] && QT.UNIVERSE[t.sym].lot !== t.lot ? `<div class="warn">⚠ Entered with lot ${t.lot}; exchange lot is now ${QT.UNIVERSE[t.sym].lot}. Reset the paper account to re-size.</div>` : ''}
-      ${t.status === 'OPEN' && t.stale ? '<div class="warn">⚠ No fresh option price - P&L not updated, exits paused</div>' : t.status === 'OPEN' && t.est ? '<div class="warn">⚠ Option quote looks wrong (stale/empty book) - P&L shown is the model estimate, exits paused</div>' : ''}
-      ${t.sizeNote ? `<div class="sub">${esc(t.sizeNote)}</div>` : ''}
-      ${t.status === 'OPEN' ? `<div class="sub">Exit ${num(t.exitTarget)} target / ${num(t.exitSL)} SL premium · 20-DMA ${num(t.ma20)}</div><div class="btns"><button class="btn sm red" data-act="exit" data-id="${t.id}">Exit position</button></div>` : ''}</div>`;
+      ${sigVsOrder(t)}
+      ${t.status === 'OPEN' ? exitInfo(t) : ''}
+      ${t.status === 'OPEN' ? `<div class="btns"><button class="btn sm red" data-act="exit" data-id="${t.id}">Exit position</button></div>` : ''}</div>`;
     }).join('') || '<div class="card sub">Nothing here.</div>';
     return h;
   }
@@ -364,7 +409,7 @@
       const pnl = t.status === 'OPEN' ? null : t.pnl, o = A.open['t' + t.id];
       return `<div class="card" data-act="tog" data-k="t${t.id}"><div class="row"><b>${t.sym}</b>${chip(t.signal, t.signal)}<span class="chip ${/TARGET/.test(t.status) ? 'TARGET' : /SL/.test(t.status) ? 'SL' : ''}">${t.status}</span><span class="sp"></span><b class="${cls(pnl)}">${pnl == null ? 'open' : inr(pnl)}</b></div>
       <div class="sub">${t.id} · ${dmy(t.time)} ${hhmm(t.time)}${t.exitTime ? ' → ' + dmy(t.exitTime) + ' ' + hhmm(t.exitTime) : ''} · ${esc(t.stratName)} · conv ${t.conviction ?? '-'}</div>
-      ${o ? `<div class="tk">${t.legs.map((l) => `${l.a === 'B' ? 'BUY ' : 'SELL'} ${l.K} ${l.t} @ ${num(l.fill)}${l.exitPx != null ? ' → ' + num(l.exitPx) : ''}`).join('<br>')}</div>
+      ${o ? `${candleLine(t)}<div class="tk">${t.legs.map((l) => legHtml(l.a, l.K, l.t, l.fill) + (l.exitPx != null ? ' → ' + num(l.exitPx) : '')).join('<br>')}</div>
       <div class="grid"><div>Order<b>${t.orderId}</b></div><div>Dr/Cr<b>${t.net > 0 ? 'Debit' : 'Credit'}</b></div><div>Lots · Qty<b>${t.lots} · ${t.qty}</b></div><div>Entry spot<b>${num(t.entrySpot)}</b></div><div>Target / SL spot<b>${t.targetSpot ? num(t.targetSpot, 1) + ' / ' + num(t.slSpot, 1) : '-'}</b></div><div>Expiry · exit-by<b>${t.expiry.slice(5)} · ${t.exitBy.slice(5)}</b></div><div>Entry prem<b>${num(Math.abs(t.net))}</b></div><div>Target / SL prem<b>${num(t.exitTarget)} / ${num(t.exitSL)}</b></div><div>Profit@T / Loss@SL<b>${inr(t.profitAtTarget)} / ${inr(-t.lossAtSL)}</b></div><div>Gross<b class="${cls(t.pnlGross)}">${inr(t.pnlGross)}</b></div><div>Charges<b>${inr((t.chEntry || 0) + (t.chExit || 0))}</b></div><div>Origin<b>${t.origin}</b></div></div>
       <div class="sub">Sizing: ${esc(t.sizeNote || '-')}</div><div class="sub">Book rules: ${esc(t.details || '')}</div><div class="why">${esc(t.why || '')}</div>` : ''}</div>`;
     }).join('') || '<div class="card sub">No trades in the register yet.</div>';
@@ -399,18 +444,25 @@
   // ---------- More: Settings / Alerts / About ----------
   const SCHEMA = [
     ['Signal logic (closed candles)', [['strictBook', 'STRICT BOOK MODE: every measurable book rule is a hard FAIL (no warnings), lots exactly per book', 'bool'], ['closedCandle', 'Closed-candle check: signals use only fully closed candles', 'bool'], ['candleTf', 'Candle timeframe', 'sel', [[5, '5 minutes'], [15, '15 minutes'], [30, '30 minutes'], [60, '60 minutes']]], ['confirmN', 'Confirm on N consecutive closed candles', 'sel', [[1, '1 (act on first close)'], [2, '2 candles'], [3, '3 candles']]],
-      ['closeExit', 'Spot target/SL checked on candle close only', 'bool'], ['maExit', 'Exit when entry reason is gone (20-DMA close / range break)', 'bool'], ['neutralTrade', 'Neutral strategies 7-10 act as trades (workbook only plans them)', 'bool']]],
+      ['neutralTrade', 'Neutral strategies 7-10 act as trades (workbook only plans them)', 'bool']]],
     ['Agent 2 · history & movement', [['a2Enabled', 'Agent 2 checks every book-triggered trade before the Judge decides', 'bool'], ['a2Strict', 'Judge strictness', 'ssel', [['lenient', 'Lenient (ignore if Agent 2 score < -2)'], ['normal', 'Normal (ignore if score < 0)'], ['strict', 'Strict (need score >= +2)']]], ['a2Weight', 'Agent 2 weight in final conviction (%)', 'pct']]],
     ['Money management', [['sizing', 'Lot sizing (strict mode always uses the book formula)', 'ssel', [['workbook', 'Book: lots = ROUNDUP(profit goal / (lot x profit per share))'], ['ai', 'AI: risk-based, scaled by conviction, within caps']]], ['capital', 'Starting capital (₹) – applies on Reset', 'num'], ['riskPct', 'Risk per trade at stop-loss (% of equity)', 'pct'], ['marginPerTradePct', 'Max margin per trade (% of equity)', 'pct'],
       ['maxUtilPct', 'Max capital utilised in total (%)', 'pct'], ['dailyLossPct', 'Stop new orders after daily loss of (% of capital)', 'pct'], ['maxTradesPerDay', 'Max new trades per day', 'num'], ['maxOpen', 'Max open positions', 'num']]],
-    ['Paper account & orders', [['autoTrade', 'Auto paper-trade triggered signals', 'bool'], ['minConviction', 'Min conviction to auto-trade', 'num'],
+    ['Paper account & orders', [['autoTrade', 'Auto paper-trade triggered signals', 'bool'], ['fillMode', 'Entry fill price', 'ssel', [['ltp', 'Last traded price (like a broker app)'], ['ask', 'Ask / bid - pay the whole spread (strictest)']]], ['minConviction', 'Min conviction to auto-trade', 'num'],
       ['charges', 'Apply brokerage & taxes', 'bool'], ['brokerage', 'Brokerage per order (₹)', 'num'], ['sttPct', 'STT on sell premium (%)', 'pct'], ['slipPct', 'Slippage on fills (%)', 'pct']]],
-    ['Safety filters (bad quotes)', [['quoteGuard', 'Reject entries whose option price is far from fair value', 'bool'], ['settleMin', 'No premium-based exits in first N minutes after 09:15', 'num'], ['exitConfirm', 'Premium target/stop must repeat on N consecutive refreshes', 'num']]],
-    ['Profit booking', [['exitOnPremiumTarget', 'Exit as soon as the OPTION premium target is met (do not wait for the spot target)', 'bool'], ['reentryLock', 'After an exit, block the same-direction order on that symbol until the trend reverses', 'ssel', [['target', 'After profit exits (target / profit lock)'], ['both', 'After any exit (profit or stop-loss)'], ['off', 'Off']]], ['bookPct', 'Book profit at this % of target (any time market is open)', 'pct'], ['lockProfit', 'Trailing profit lock', 'bool'], ['lockAt', 'Lock arms once profit reaches (% of target)', 'pct'], ['lockKeep', 'Exit if profit falls back to (% of target)', 'pct']]],
-    ['Strategy parameters (Settings sheet)', [['profitGoal', 'Profit goal per trade (₹) – workbook sizing', 'num'], ['vixThreshold', 'VIX threshold debit/credit', 'num'], ['targetPct', 'Underlying target (%)', 'pct'], ['slPct', 'Underlying stop-loss (%)', 'pct'],
-      ['widthStock', 'Spread width – stocks (% of spot)', 'pct'], ['widthNifty', 'Spread width – Nifty (% of spot)', 'pct'], ['maxLots', 'Max lots per trade', 'num'], ['minEdge', 'Min agent edge (max 6)', 'num'], ['holdDays', 'Assumed days to reach target', 'num'], ['ivMult', 'Stock IV = VIX ×', 'num'], ['rf', 'Risk-free rate (%)', 'pct'], ['maxAge', 'Max data age counted as LIVE (sec)', 'num']]],
+    ['Safety filters (bad quotes)', [['quoteGuard', 'Reject entries whose option price is far from fair value', 'bool']]],
+    ['Target & exit rules (as per book)', [
+      ['targetBasis', 'TARGET is met when', 'ssel', [['premium', 'Option premium reaches the book target premium'], ['spot', 'Underlying price reaches the target level'], ['either', 'Either one (whichever first)'], ['both', 'BOTH (verified on premium and underlying)']]],
+      ['slBasis', 'STOP-LOSS is hit when', 'ssel', [['premium', 'Option premium falls to the book stop premium'], ['spot', 'Underlying price reaches the stop level'], ['either', 'Either one (whichever first)'], ['both', 'BOTH (verified on premium and underlying)']]],
+      ['targetConfirm', 'Verify target on N consecutive refreshes', 'num'], ['slConfirm', 'Verify stop-loss on N consecutive refreshes', 'num'], ['bookPct', 'Book at this % of the target profit', 'pct'],
+      ['targetPct', 'Underlying target (% of spot)', 'pct'], ['slPct', 'Underlying stop-loss (% of spot)', 'pct'], ['creditTP', 'Credit trades: take profit at % of credit', 'pct'],
+      ['exitBefore', 'Exit-by: bought options N days before expiry', 'num'], ['holdDays', 'Assumed days to reach target (sets the target premium)', 'num'],
+      ['maExit', 'Exit when the entry reason is gone (20-DMA close / range break)', 'bool'], ['closeExit', 'Underlying levels checked on closed candles', 'bool'], ['settleMin', 'No premium-based exits in first N minutes after 09:15', 'num'],
+      ['reentryLock', 'After an exit, block the same-direction order until the trend reverses', 'ssel', [['target', 'After profit exits'], ['both', 'After any exit'], ['off', 'Off']]],
+      ['lockProfit', 'Trailing profit lock (extra, not in the book)', 'bool'], ['lockAt', 'Lock arms at (% of target)', 'pct'], ['lockKeep', 'Exit if profit falls back to (% of target)', 'pct']]],
+    ['Strategy parameters (Settings sheet)', [['profitGoal', 'Profit goal per trade (₹) – workbook sizing', 'num'], ['vixThreshold', 'VIX threshold debit/credit', 'num'], ['widthStock', 'Spread width – stocks (% of spot)', 'pct'], ['widthNifty', 'Spread width – Nifty (% of spot)', 'pct'], ['maxLots', 'Max lots per trade', 'num'], ['minEdge', 'Min agent edge (max 6)', 'num'], ['ivMult', 'Stock IV = VIX ×', 'num'], ['rf', 'Risk-free rate (%)', 'pct'], ['maxAge', 'Max data age counted as LIVE (sec)', 'num']]],
     ['Book rules (Settings sheet)', [['minOI', 'Min open interest per leg (contracts)', 'num'], ['minVol', 'Min avg daily volume (shares)', 'num'], ['maxBA', 'Max bid-ask spread (% of mid)', 'pct'], ['minYield', 'Min credit yield (credit / width)', 'pct'], ['minDTEBuy', 'Min days to expiry – BOUGHT options', 'num'],
-      ['maxDTESell', 'Max days to expiry – SOLD options', 'num'], ['exitBefore', 'Exit bought options N days before expiry', 'num'], ['creditTP', 'Credit trades: take profit at % of credit', 'pct']]],
+      ['maxDTESell', 'Max days to expiry – SOLD options', 'num']]],
   ];
   const field = ([k, l, ty, opts]) => ty === 'bool' ? `<label class="tg"><span>${l}</span><input type="checkbox" data-k="${k}" ${S[k] ? 'checked' : ''}></label>`
     : ty === 'sel' ? `<label>${l}<select data-k="${k}" data-n="1">${opts.map(([v, t]) => `<option value="${v}" ${+S[k] === v ? 'selected' : ''}>${t}</option>`).join('')}</select></label>`

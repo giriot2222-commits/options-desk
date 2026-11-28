@@ -48,7 +48,7 @@
     enter(row, S, spots, src, meta) {
       meta = meta || {};
       if (P.st.capital == null) P.st.capital = S.capital;
-      const base = { sym: row.sym, stratName: row.stratName, src, lots: row.lots, qty: row.qty, expiry: row.expiry, conviction: row.conviction, signal: row.decision, candle: meta.candle || null,
+      const base = { sym: row.sym, stratName: row.stratName, src, lots: row.lots, qty: row.qty, expiry: row.expiry, conviction: row.conviction, signal: row.decision, candle: meta.candle || null, candleClose: meta.candleClose ?? null, tf: S.candleTf,
         legs: row.legs.map((l) => ({ a: l.a, t: l.t, K: l.K, px: l.p })) };
       const reject = (reason) => { P.logOrder({ ...base, status: 'REJECTED', reason }); P.save(); return { ok: false, msg: reason }; };
       if (!QT.canTrade(S, src)) return reject(QT.isWeekday() && !QT.dayAllowed(S) ? `${QT.dayName(QT.istNow().getUTCDay())} is not enabled for new orders (Settings > Trading days)` : `Outside trading time ${S.tradeStart}-${S.tradeEnd} IST`);
@@ -68,7 +68,14 @@
       if (lots < 1) return reject(sz.mode === 'workbook' ? `Capital limits: the book lots (${sz.wb}) need margin ${sz.need} but only ${Math.round(Math.min(eq * S.marginPerTradePct, eq * S.maxUtilPct - P.margin(), P.available(S)))} is allowed (free ${Math.round(P.available(S))}) - lots are never reduced` : `Capital limits: no room for 1 lot (free margin ${Math.round(P.available(S))}, utilisation cap ${(S.maxUtilPct * 100).toFixed(0)}%, per-trade cap ${(S.marginPerTradePct * 100).toFixed(0)}%, risk ${(S.riskPct * 100).toFixed(1)}%)`);
       const qty = lots * row.lot; base.lots = lots; base.qty = qty;
       const slip = S.slipPct;
-      const legs = row.legs.map((l) => ({ a: l.a, t: l.t, K: l.K, key: l.key, fill: r2(l.a === 'B' ? l.p * (1 + slip) : l.p * (1 - slip)) }));
+      // entry fill: last traded price (broker-app style, default), mid, or the full ask/bid (market order, pays the whole spread)
+      const fillOf = (l) => {
+        const q = l.q || {}, both = q.bid > 0 && q.ask > 0, mid = both ? (q.bid + q.ask) / 2 : 0, mode = S.fillMode || 'ltp';
+        if (l.src !== 'LIVE' || !both || mode === 'ask') return l.src === 'LIVE' ? l.p : l.a === 'B' ? l.p * (1 + slip) : l.p * (1 - slip);
+        if (mode === 'ltp' && q.ltp >= q.bid && q.ltp <= q.ask && q.ltp > 0) return q.ltp;
+        return mid;
+      };
+      const legs = row.legs.map((l) => ({ a: l.a, t: l.t, K: l.K, key: l.key, fill: Math.max(0.05, r2(fillOf(l))) }));
       const net = r2(legs.reduce((x, l) => x + (l.a === 'B' ? l.fill : -l.fill), 0));
       const margin = Math.round(net > 0 ? net * qty : row.maxLoss * qty);
       if (margin > P.available(S)) return reject(`Insufficient funds: margin ${margin} > available ${Math.round(P.available(S))}`);
@@ -78,11 +85,12 @@
       const t = {
         id: tid, orderId: o.id, time: o.time, sym: row.sym, signal: row.decision, conviction: row.conviction, strat: row.strat, stratName: row.stratName, bias: row.bias,
         lots, qty, lot: row.lot, expiry: row.expiry, exitBy: row.exitBy, legs, net, margin, chEntry: ch, entrySpot: spots[row.sym],
-        targetSpot: row.targetSpot, slSpot: row.slSpot, tpPnl: row.tpPnl, slPnl: row.slPnl, src: row.src, origin: src, candle: meta.candle || null,
+        targetSpot: row.targetSpot, slSpot: row.slSpot, tpPnl: row.tpPnl, slPnl: row.slPnl, src: row.src, origin: src, candle: meta.candle || null, candleClose: meta.candleClose ?? null, tf: S.candleTf,
         status: 'OPEN', pnlGross: 0, curSpot: spots[row.sym], val: net, why: row.verdict || '', ma20: meta.ma20 || null, range: row.range || null,
-        exitTarget: row.exitTarget, exitSL: row.exitSL, profitAtTarget: Math.round(row.tpPnl * qty), lossAtSL: Math.round(-row.slPnl * qty), gate: row.gate, details: row.details, buyArea: row.buyArea,
+        exitTarget: QT.xr(Math.abs(net + row.tpPnl) * 20, 0) / 20, exitSL: QT.xr((net > 0 ? Math.max(0, net + row.slPnl) : Math.abs(net + row.slPnl)) * 20, 0) / 20, profitAtTarget: Math.round(row.tpPnl * qty), lossAtSL: Math.round(-row.slPnl * qty), gate: row.gate, details: row.details, buyArea: row.buyArea,
         targetTxt: row.targetTxt, slTxt: row.slTxt, plan: row.plan, entryDay: day, debit: row.debit, peak: 0, m0: row.legs.reduce((x, l) => x + (l.a === 'B' ? l.model : -l.model), 0), spot0: row.spot,
         sizeNote: sz.mode === 'workbook' ? `Workbook sizing: ${sz.wb} lot(s) from profit goal, margin cap allows ${sz.byMargin}` : `AI sizing: risk budget ₹${sz.budget}, loss at SL ₹${sz.lossPerLot}/lot -> ${sz.byRisk} by risk, ${sz.byMargin} by margin; workbook goal lots ${sz.wb}`,
+        sigSnap: meta.sigRow ? { time: new Date().toISOString(), spot: meta.sigRow.spot, sig: meta.sigRow.sig, conviction: meta.sigRow.conviction, lots: meta.sigRow.lots, expiry: meta.sigRow.expiry, legs: meta.sigRow.legs.map((l) => ({ a: l.a, t: l.t, K: l.K, p: l.p })) } : null,
         ctx: { vix: meta.vix ?? null, edge: row.ag ? Math.abs(row.ag.edge) : null, streak: row.streak || 1, a2: row.a2 ? row.a2.score : null, conv1: row.conv1 ?? null, dte: row.dte, tf: S.candleTf, side: row.decision },
       };
       P.st.trades.unshift(t); P.save();
@@ -94,6 +102,7 @@
     markPx(q) {
       if (!q) return null;
       const bid = q.bid || 0, ask = q.ask || 0, ltp = q.ltp || 0, mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : 0;
+      if (ltp > 0 && (mid === 0 || (ltp >= bid && ltp <= ask))) return ltp; // like a broker app: P&L on the last traded price
       if (mid > 0 && (ask - bid) / mid <= 0.25) return mid;
       if (ltp > 0) return ltp;
       if (mid > 0) return mid;
@@ -160,22 +169,25 @@
         if (v != null) { t.val = r2(v); t.pnlGross = r2((v - t.net) * t.qty); }
         const sp = S.closeExit && sig && sig[t.sym] ? sig[t.sym] : t.curSpot;
         const pps = t.val - t.net, ok = v != null && !t.est;
-        let why = null, premium = false, viaTS = false;
-        // premium TARGET: exit as soon as the option target is met on live two-sided quotes - never wait for the spot target
-        if (S.exitOnPremiumTarget !== false) {
-          const vt = P.valueTwoSided(t, ch);
-          if (vt != null && vt - t.net >= t.tpPnl * (S.bookPct || 1) && settled) { why = 'TARGET HIT'; viaTS = true; if (v == null || t.est) { v = vt; t.val = r2(vt); t.pnlGross = r2((vt - t.net) * t.qty); t.est = false; } }
+        let why = null, viaTS = false;
+        // ---- TARGET / STOP-LOSS exactly as set in Settings (basis + verification) ----
+        const vt = S.targetBasis === 'spot' ? null : P.valueTwoSided(t, ch);
+        const premT = vt != null ? vt - t.net >= t.tpPnl * (S.bookPct || 1) : ok && pps >= t.tpPnl * (S.bookPct || 1);
+        const premS = ok && pps <= t.slPnl;
+        let spT = false, spS = false; const hasSpot = !!t.targetSpot;
+        if (hasSpot) {
+          if (t.bias === 'U') { spT = sp >= t.targetSpot; spS = sp <= t.slSpot; } else if (t.bias === 'D') { spT = sp <= t.targetSpot; spS = sp >= t.slSpot; }
         }
-        if (!why && ok) {
+        const tb = hasSpot ? S.targetBasis || 'premium' : 'premium', sb = hasSpot ? S.slBasis || 'premium' : 'premium';
+        const pick = (b, pm, sp2) => (b === 'premium' ? pm : b === 'spot' ? sp2 : b === 'either' ? pm || sp2 : pm && sp2);
+        const tMet = pick(tb, premT, spT) && (settled || tb === 'spot'), sMet = pick(sb, premS, spS) && (settled || sb === 'spot');
+        t.tN = tMet ? (t.tN || 0) + 1 : 0; t.sN = sMet ? (t.sN || 0) + 1 : 0;
+        t.verify = { premNow: Math.abs(t.val), premT, premS, spT, spS, tMet, sMet, tN: t.tN, sN: t.sN, tb, sb, hasSpot, tc: S.targetConfirm || 1, sc: S.slConfirm || 1, est: t.est, stale: t.stale };
+        if (tMet && t.tN >= (S.targetConfirm || 1)) { why = 'TARGET HIT'; viaTS = vt != null; }
+        else if (sMet && t.sN >= (S.slConfirm || 1)) why = 'SL HIT';
+        else if (S.lockProfit && ok) { // optional trailing lock (not part of the book)
           t.peak = Math.max(t.peak || 0, pps);
-          if (S.exitOnPremiumTarget === false) { /* wait for the spot target only */ }
-          else if (pps >= t.tpPnl * (S.bookPct || 1)) { why = 'TARGET HIT'; premium = true; } // profit is booked any time the market is open
-          if (why) { /* target already found */ } else if (pps <= t.slPnl) { why = 'SL HIT'; premium = true; }
-          else if (S.lockProfit && t.peak >= t.tpPnl * S.lockAt && pps <= t.tpPnl * S.lockKeep) { why = 'PROFIT LOCK'; premium = true; }
-        }
-        if (!why && t.targetSpot) {
-          if (t.bias === 'U') why = sp >= t.targetSpot ? 'TARGET HIT' : sp <= t.slSpot ? 'SL HIT' : null;
-          else if (t.bias === 'D') why = sp <= t.targetSpot ? 'TARGET HIT' : sp >= t.slSpot ? 'SL HIT' : null;
+          if (t.peak >= t.tpPnl * S.lockAt && pps <= t.tpPnl * S.lockKeep) why = 'PROFIT LOCK';
         }
         // Rule 8 - entry reason gone (trading plan): spot closes through the 20-DMA / leaves the expected range
         if (!why && S.maExit && reasonTime) {
@@ -190,10 +202,7 @@
         }
         if (!why && today >= t.exitBy) why = 'EXIT-BY DUE';
         if (!why && today >= t.expiry) why = 'EXPIRED';
-        // premium-based exits: not in the opening-settle minutes, and must repeat on N consecutive marks (filters bad ticks)
-        if (why && premium) { t.hit = (t.hitWhy === why ? (t.hit || 0) : 0) + 1; t.hitWhy = why; if (!settled || t.hit < (S.exitConfirm || 1)) why = null; }
-        else if (!why || !premium) { if (!premium) { t.hit = 0; t.hitWhy = null; } }
-        if (why && v != null && (ok || viaTS) && canExit) { P.close(t, why, S, ch); out.push(t); }
+        if (why && v != null && (ok || viaTS || (why === 'TARGET HIT' && tb === 'spot')) && canExit) { P.close(t, why, S, ch); out.push(t); }
       }
       P.st.curve.push([Date.now(), P.equity(S)]); if (P.st.curve.length > 600) P.st.curve.shift();
       P.save();
@@ -202,8 +211,8 @@
 
     close(t, why, S, chain) {
       const fills = t.legs.map((l) => {
-        const q = chain.get(l.K)[l.t], px = P.exitPx(q, l.a, S);
-        l.exitPx = r2(Math.max(0.05, l.a === 'B' ? px * (1 - S.slipPct) : px * (1 + S.slipPct)));
+        const q = chain.get(l.K)[l.t], px = P.exitPx(q, l.a, S), sl = q.bid > 0 && q.ask > 0 ? 0 : S.slipPct;
+        l.exitPx = r2(Math.max(0.05, l.a === 'B' ? px * (1 - sl) : px * (1 + sl)));
         return { side: l.a === 'B' ? 'S' : 'B', price: l.exitPx, qty: t.qty };
       });
       const exitVal = t.legs.reduce((s, l) => s + (l.a === 'B' ? l.exitPx : -l.exitPx), 0);
