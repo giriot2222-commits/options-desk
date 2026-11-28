@@ -12,16 +12,17 @@
   let S = { ...QT.DEFAULTS, strat: { ...QT.DEFAULTS.strat }, favs: [], force: {}, spotOv: {}, tuneLog: [], lastTuneN: 0 };
   try { const j = JSON.parse(localStorage.getItem('qt_cfg4')); if (j) S = { ...S, ...j, strat: { ...S.strat, ...(j.strat || {}) }, force: j.force || {}, spotOv: j.spotOv || {}, tuneLog: j.tuneLog || [] }; } catch (e) {}
   const saveS = () => localStorage.setItem('qt_cfg4', JSON.stringify(S));
+  if ((S.cfgVer || 0) < 6) { S.sizing = 'workbook'; S.strictBook = true; S.lotSource = 'book'; S.cfgVer = 6; saveS(); }
   QT.Paper.load(); QT.Alerts.load(); QT.Run.load();
   let freshStart = false;
-  try { if (localStorage.getItem('qt_dataver') !== '5') { QT.Paper.reset(S.capital); QT.Alerts.log = []; QT.Alerts.seen = {}; QT.Alerts.save(); QT.Run.clear(); localStorage.setItem('qt_dataver', '5'); freshStart = true; } } catch (e) {}
+  try { if (localStorage.getItem('qt_dataver') !== '6') { QT.Paper.reset(S.capital); QT.Alerts.log = []; QT.Alerts.seen = {}; QT.Alerts.save(); QT.Run.clear(); localStorage.setItem('qt_dataver', '6'); freshStart = true; } } catch (e) {}
   if (!Array.isArray(S.days)) S.days = [1, 2, 3, 4, 5];
 
   const A = { tab: 'watch', wl: 'sig', q: '', ag: 'debate', df: 'all', pq: '', ord: 'all', pos: 'open', hf: 'all', more: 'set', hseg: 'reg', modal: null, hist: {}, feed: null, snap: null, rows: [], ignored: [], all: {}, order: [],
     expiries: { stock: [], index: [] }, status: '', last: null, lastOk: null, busy: false, toast: '', chains: {}, open: {}, sheet: null, ind: {}, sig: null, sigTs: {}, streak: {}, tried: {}, cid: null, dirty: false };
   const SYMS = Object.keys(QT.UNIVERSE);
   SYMS.forEach((s) => (QT.UNIVERSE[s].wlot = QT.UNIVERSE[s].lot));
-  try { const c = JSON.parse(localStorage.getItem('qt_lots')); if (c && c.m && S.mode === 'live') SYMS.forEach((s) => { if (c.m[s]) { QT.UNIVERSE[s].lot = c.m[s]; QT.UNIVERSE[s].live = true; } }); } catch (e) {}
+  try { const c = JSON.parse(localStorage.getItem('qt_lots')); if (c && c.m && S.mode === 'live') SYMS.forEach((s) => { if (c.m[s]) { QT.UNIVERSE[s].exch = c.m[s]; if (S.lotSource === 'upstox') { QT.UNIVERSE[s].lot = c.m[s]; QT.UNIVERSE[s].live = true; } } }); } catch (e) {}
 
   // ---------- data refresh ----------
   async function pool(items, n, fn) {
@@ -48,12 +49,7 @@
       A.lastOk = Date.now();
       await pool(SYMS.filter((s) => !A.ind[s]), 5, async (s) => { A.ind[s] = QT.indicators(await A.feed.candles(s)); });
       // lot sizes: take the exchange lot size from Upstox (the workbook list can be out of date)
-      if (S.mode === 'live' && S.lotSync && A.lotDay !== today) {
-        A.lotDay = today; const changed = [];
-        await pool(SYMS, 3, async (s) => { const l = await A.feed.lotSize(s); if (l) { if (l !== QT.UNIVERSE[s].lot) changed.push(`${s} ${QT.UNIVERSE[s].lot}→${l}`); QT.UNIVERSE[s].lot = l; QT.UNIVERSE[s].live = true; } });
-        try { const m = {}; SYMS.forEach((s) => (m[s] = QT.UNIVERSE[s].lot)); localStorage.setItem('qt_lots', JSON.stringify({ d: today, m })); } catch (e) {}
-        if (changed.length) { A.dirty = true; QT.Alerts.add(S, 'INFO', '', 'Lot sizes updated from Upstox: ' + changed.join(', ')); toast('Lot sizes updated from Upstox (' + changed.length + ')'); }
-      }
+      if (S.mode === 'live' && S.lotSync && A.lotDay !== today) { A.lotDay = today; await lotCheck(false); }
       if (!A.expiries.stock.length) {
         let st = [], ix = [];
         try { [st, ix] = await Promise.all([A.feed.expiries('RELIANCE'), A.feed.expiries('NIFTY')]); } catch (e) {}
@@ -89,6 +85,7 @@
         }
         A.rows.forEach((r) => (r.streak = (A.streak[r.sym] || { n: 1 }).n));
         A.all = {}; rows.forEach((r) => (A.all[r.sym] = r));
+        QT.Paper.releaseLocks(A.all).forEach((s) => QT.Run.add(`${s}: trend reversed - re-entry lock released`));
         A.chains = chains;
         if (newBoundary) QT.Run.add(`Candle ${S.candleTf}m closed - ${A.rows.length} signal(s)` + (A.rows.length ? ': ' + A.rows.slice(0, 6).map((r) => `${r.sym} ${r.decision} ${r.conviction}`).join(', ') : ''));
         // alert: NEW SIGNAL once per day per trade, conviction >= threshold
@@ -112,7 +109,8 @@
         for (const r of A.rows) {
           if (r.conviction < S.minConviction || (r.streak || 1) < S.confirmN) continue;
           const k = r.sym + '|' + A.cid; if (A.tried[k]) continue;
-          if (!S.allowDup && QT.Paper.open().some((t) => t.sym === r.sym)) continue;
+          if (QT.Paper.open().some((t) => t.sym === r.sym)) continue;
+          if (QT.Paper.lockedFor(r, S)) { const lk = QT.Paper.lockedFor(r, S), kk = 'lock|' + r.sym + '|' + lk.tid; if (!A.tried[kk]) { A.tried[kk] = 1; QT.Run.add(`${r.sym}: re-entry locked after ${lk.why} - waiting for reversal`); } continue; }
           A.tried[k] = 1;
           const res = await placeOrder(r, 'auto');
           QT.Run.add(res.ok ? `ORDER ${r.sym} ${r.decision} ${r.stratName} ${res.trade.lots}L executed` : `ORDER ${r.sym} rejected: ${res.msg}`);
@@ -123,6 +121,16 @@
       A.last = new Date(); A.status = '';
     } catch (e) { A.status = 'Error: ' + e.message; QT.Alerts.add(S, 'ERROR', 'Feed error', e.message, 'err|' + e.message.slice(0, 30) + '|' + Math.floor(Date.now() / 3600000)); }
     A.busy = false; render();
+  }
+  // compare the book's lot sizes with the exchange lot sizes (Upstox contract list); apply them only if Lot source = Upstox
+  async function lotCheck(show) {
+    if (S.mode !== 'live' || !A.feed || !A.feed.lotSize) { if (show) toast('Lot check needs the Upstox live feed'); return; }
+    const diff = [];
+    await pool(SYMS, 3, async (s) => { const l = await A.feed.lotSize(s); if (l) { QT.UNIVERSE[s].exch = l; if (l !== QT.UNIVERSE[s].wlot) diff.push(`${s}: book ${QT.UNIVERSE[s].wlot} vs exchange ${l}`); if (S.lotSource === 'upstox') { QT.UNIVERSE[s].lot = l; QT.UNIVERSE[s].live = true; } } });
+    try { const m = {}; SYMS.forEach((s) => (m[s] = QT.UNIVERSE[s].exch || QT.UNIVERSE[s].lot)); localStorage.setItem('qt_lots', JSON.stringify({ d: QT.istDate(), m })); } catch (e) {}
+    A.lotReport = { time: new Date().toISOString(), n: SYMS.filter((s) => QT.UNIVERSE[s].exch).length, diff };
+    if (diff.length) { A.dirty = true; QT.Alerts.add(S, 'INFO', '', 'Lot size differs from the book for ' + diff.length + ' symbol(s): ' + diff.slice(0, 8).join(', '), 'lot|' + diff.length); }
+    if (show) { toast(diff.length ? diff.length + ' lot size(s) differ from the book' : 'All lot sizes match the book'); render(); }
   }
   async function placeOrder(row, src) {
     let r = row, chain = null;
@@ -204,7 +212,7 @@
     return list.map((s) => {
       const c = chgOf(s), r = A.all[s], trig = isTrig(r);
       const sub = trig ? `${esc(r.stratName)} · conv ${r.conviction}${S.confirmN > 1 ? ` · ${r.streak}/${S.confirmN} candles` : ''}` : r ? esc((r.reason || '').slice(0, 44)) : '';
-      return `<div class="wr" data-act="sheet" data-s="${s}"><div><b>${S.favs.includes(s) ? '★ ' : ''}${s}</b> ${trig ? chip(r.decision) : ''}<span class="sub">${sub}</span></div><div class="rt"><b>${c.ltp ? num(c.ltp) : '-'}</b><span class="${cls(c.pct)}">${c.pct >= 0 ? '+' : ''}${c.pct.toFixed(2)}%</span></div></div>`;
+      return `<div class="wr" data-act="sheet" data-s="${s}"><div><b>${S.favs.includes(s) ? '★ ' : ''}${QT.Paper.st.locks && QT.Paper.st.locks[s] ? '🔒 ' : ''}${s}</b> ${trig ? chip(r.decision) : ''}<span class="sub">${sub}</span></div><div class="rt"><b>${c.ltp ? num(c.ltp) : '-'}</b><span class="${cls(c.pct)}">${c.pct >= 0 ? '+' : ''}${c.pct.toFixed(2)}%</span></div></div>`;
     }).join('') || `<div class="card sub">${A.wl === 'fav' ? 'No favourites yet. Open a symbol and tap ★.' : A.wl === 'sig' ? 'No triggered signals on the last closed candle.' : 'No match'}</div>`;
   }
 
@@ -228,7 +236,7 @@
     const c = chgOf(sym), ind = A.ind[sym] || {}, r = A.all[sym], trig = isTrig(r), u = QT.UNIVERSE[sym];
     let h = `<div class="row"><span class="big">${sym}</span><span class="sp"></span><button class="star" data-act="fav" data-s="${sym}">${S.favs.includes(sym) ? '★' : '☆'}</button><button class="btn sm ghost" data-act="close-sheet">✕</button></div>
       <div class="row"><span class="big">${num(c.ltp)}</span><span class="${cls(c.pct)}">${c.pct >= 0 ? '+' : ''}${c.pct.toFixed(2)}%</span></div>
-      <div class="grid"><div>Prev close<b>${num(ind.prevClose)}</b></div><div>~20-DMA<b>${num(ind.ma20)}</b></div><div>~50-DMA<b>${num(ind.ma50)}</b></div><div>52W high / low<b>${num(ind.hi52, 0)} / ${num(ind.lo52, 0)}</b></div><div>60d high / low<b>${num(ind.hi60, 0)} / ${num(ind.lo60, 0)}</b></div><div>Lot (${u.live ? 'Upstox live' : 'workbook'}) · avg vol<b>${u.lot} · ${ind.avgVol ? Math.round(ind.avgVol / 1000) + 'k' : '-'}</b></div></div>
+      <div class="grid"><div>Prev close<b>${num(ind.prevClose)}</b></div><div>~20-DMA<b>${num(ind.ma20)}</b></div><div>~50-DMA<b>${num(ind.ma50)}</b></div><div>52W high / low<b>${num(ind.hi52, 0)} / ${num(ind.lo52, 0)}</b></div><div>60d high / low<b>${num(ind.hi60, 0)} / ${num(ind.lo60, 0)}</b></div><div>Lot (${u.live ? 'exchange' : 'book'}) · avg vol<b>${u.lot} · ${ind.avgVol ? Math.round(ind.avgVol / 1000) + 'k' : '-'}</b>${u.exch && u.exch !== u.lot ? `<span class="warn">⚠ exchange ${u.exch}</span>` : ''}</div></div>
       <div class="sub">Closed ${S.candleTf}m candle: <b>${A.sig && A.sig[sym] ? num(A.sig[sym]) : '-'}</b>${A.sigTs[sym] ? ' @ ' + hhmm(A.sigTs[sym]) : ''} · agents use this close, not the live tick</div>`;
     if (!r) return h;
     h += `<div class="card" style="margin-top:10px"><h4>Agent 1 · book rules (Bull vs Bear)</h4>`;
@@ -313,6 +321,8 @@
       <div class="days">${[1, 2, 3, 4, 5, 6, 0].filter((d) => d >= 1 && d <= 5 || S.days.includes(d)).map((d) => `<span class="dchip ${S.days.includes(d) ? 'on' : ''} ${d === wd ? 'today' : ''}">${S.days.includes(d) ? '✓' : '✗'} ${QT.dayName(d)}</span>`).join('')}</div>
       <div class="tiles"><div>Orders today<b>${done.length} done · ${rej.length} rej</b></div><div>New trades<b>${newT} / ${S.maxTradesPerDay}</b></div><div>Exits today<b>${exits.length}</b></div><div>Realized today<b class="${cls(rt)}">${inr(rt)}</b></div><div>Open now<b>${P.open().length} / ${S.maxOpen}</b></div><div>Loss limit used<b>${rt < 0 ? Math.min(100, (-rt / lim) * 100).toFixed(0) : 0}%</b></div></div>
       <div class="btns"><button class="btn sm ghost" data-act="newsession">Clear all old orders &amp; start fresh</button></div></div>`;
+    const lks = Object.entries(P.st.locks || {});
+    if (lks.length) h += `<div class="card"><h4>Re-entry locked (waiting for reversal)</h4>${lks.map(([sy, l]) => `<div class="kv"><b>🔒 ${esc(sy)}</b> ${l.dir === 'U' ? 'bullish' : l.dir === 'D' ? 'bearish' : 'neutral'} orders blocked since ${esc(l.why)} ${hhmm(l.since)}</div>`).join('')}</div>`;
     const lg = QT.Run.log.filter((x) => isToday(x.t)).slice(0, 14);
     h += `<div class="card"><h4>Today's run</h4>${lg.map((x) => `<div class="kv"><b>${hhmm(x.t)}</b> ${esc(x.msg)}</div>`).join('') || '<div class="sub">Nothing yet today.</div>'}</div>`;
     return h;
@@ -326,6 +336,7 @@
       <div class="sub">${t.id} · ${t.lots}L (${t.qty}) · exp ${t.expiry} · ${t.status === 'OPEN' ? 'exit by ' + t.exitBy : t.status}</div>
       <div class="tk">${t.legs.map((l) => `${l.a === 'B' ? 'BUY ' : 'SELL'} ${l.K} ${l.t} @ ${num(l.fill)}${l.exitPx != null ? ' → ' + num(l.exitPx) : ''}`).join('<br>')}</div>
       <div class="sub">Spot ${num(t.entrySpot)} → ${num(t.status === 'OPEN' ? t.curSpot : t.exitSpot)}${t.targetSpot ? ` · T ${num(t.targetSpot)} · SL ${num(t.slSpot)}` : t.targetTxt ? ' · ' + esc(t.targetTxt) : ''} · margin ${inr(t.margin)}</div>
+      ${t.status === 'OPEN' ? `<div class="sub">Option now <b>${num(Math.abs(t.val))}</b> → target <b class="pos">${num(t.exitTarget)}</b> · stop <b class="neg">${num(t.exitSL)}</b> (exits on the option target, not only the spot target)</div>` : ''}
       <div class="sub">Profit at target <b class="pos">${inr(t.profitAtTarget)}</b> · Loss at SL <b class="neg">${inr(-t.lossAtSL)}</b> · P&L is marked at mid / last price</div>
       ${QT.UNIVERSE[t.sym] && QT.UNIVERSE[t.sym].lot !== t.lot ? `<div class="warn">⚠ Entered with lot ${t.lot}; exchange lot is now ${QT.UNIVERSE[t.sym].lot}. Reset the paper account to re-size.</div>` : ''}
       ${t.status === 'OPEN' && t.stale ? '<div class="warn">⚠ No fresh option price - P&L not updated, exits paused</div>' : t.status === 'OPEN' && t.est ? '<div class="warn">⚠ Option quote looks wrong (stale/empty book) - P&L shown is the model estimate, exits paused</div>' : ''}
@@ -387,15 +398,15 @@
 
   // ---------- More: Settings / Alerts / About ----------
   const SCHEMA = [
-    ['Signal logic (closed candles)', [['closedCandle', 'Closed-candle check: signals use only fully closed candles', 'bool'], ['candleTf', 'Candle timeframe', 'sel', [[5, '5 minutes'], [15, '15 minutes'], [30, '30 minutes'], [60, '60 minutes']]], ['confirmN', 'Confirm on N consecutive closed candles', 'sel', [[1, '1 (act on first close)'], [2, '2 candles'], [3, '3 candles']]],
+    ['Signal logic (closed candles)', [['strictBook', 'STRICT BOOK MODE: every measurable book rule is a hard FAIL (no warnings), lots exactly per book', 'bool'], ['closedCandle', 'Closed-candle check: signals use only fully closed candles', 'bool'], ['candleTf', 'Candle timeframe', 'sel', [[5, '5 minutes'], [15, '15 minutes'], [30, '30 minutes'], [60, '60 minutes']]], ['confirmN', 'Confirm on N consecutive closed candles', 'sel', [[1, '1 (act on first close)'], [2, '2 candles'], [3, '3 candles']]],
       ['closeExit', 'Spot target/SL checked on candle close only', 'bool'], ['maExit', 'Exit when entry reason is gone (20-DMA close / range break)', 'bool'], ['neutralTrade', 'Neutral strategies 7-10 act as trades (workbook only plans them)', 'bool']]],
     ['Agent 2 · history & movement', [['a2Enabled', 'Agent 2 checks every book-triggered trade before the Judge decides', 'bool'], ['a2Strict', 'Judge strictness', 'ssel', [['lenient', 'Lenient (ignore if Agent 2 score < -2)'], ['normal', 'Normal (ignore if score < 0)'], ['strict', 'Strict (need score >= +2)']]], ['a2Weight', 'Agent 2 weight in final conviction (%)', 'pct']]],
-    ['Money management', [['sizing', 'Lot sizing', 'ssel', [['ai', 'AI: risk-based, scaled by conviction, within caps'], ['workbook', 'Workbook: lots from profit goal']]], ['capital', 'Starting capital (₹) – applies on Reset', 'num'], ['riskPct', 'Risk per trade at stop-loss (% of equity)', 'pct'], ['marginPerTradePct', 'Max margin per trade (% of equity)', 'pct'],
-      ['maxUtilPct', 'Max capital utilised in total (%)', 'pct'], ['dailyLossPct', 'Stop new orders after daily loss of (% of capital)', 'pct'], ['maxTradesPerDay', 'Max new trades per day', 'num'], ['maxOpen', 'Max open positions', 'num'], ['allowDup', 'Allow duplicate symbol', 'bool']]],
+    ['Money management', [['sizing', 'Lot sizing (strict mode always uses the book formula)', 'ssel', [['workbook', 'Book: lots = ROUNDUP(profit goal / (lot x profit per share))'], ['ai', 'AI: risk-based, scaled by conviction, within caps']]], ['capital', 'Starting capital (₹) – applies on Reset', 'num'], ['riskPct', 'Risk per trade at stop-loss (% of equity)', 'pct'], ['marginPerTradePct', 'Max margin per trade (% of equity)', 'pct'],
+      ['maxUtilPct', 'Max capital utilised in total (%)', 'pct'], ['dailyLossPct', 'Stop new orders after daily loss of (% of capital)', 'pct'], ['maxTradesPerDay', 'Max new trades per day', 'num'], ['maxOpen', 'Max open positions', 'num']]],
     ['Paper account & orders', [['autoTrade', 'Auto paper-trade triggered signals', 'bool'], ['minConviction', 'Min conviction to auto-trade', 'num'],
       ['charges', 'Apply brokerage & taxes', 'bool'], ['brokerage', 'Brokerage per order (₹)', 'num'], ['sttPct', 'STT on sell premium (%)', 'pct'], ['slipPct', 'Slippage on fills (%)', 'pct']]],
     ['Safety filters (bad quotes)', [['quoteGuard', 'Reject entries whose option price is far from fair value', 'bool'], ['settleMin', 'No premium-based exits in first N minutes after 09:15', 'num'], ['exitConfirm', 'Premium target/stop must repeat on N consecutive refreshes', 'num']]],
-    ['Profit booking', [['bookPct', 'Book profit at this % of target (any time market is open)', 'pct'], ['lockProfit', 'Trailing profit lock', 'bool'], ['lockAt', 'Lock arms once profit reaches (% of target)', 'pct'], ['lockKeep', 'Exit if profit falls back to (% of target)', 'pct']]],
+    ['Profit booking', [['exitOnPremiumTarget', 'Exit as soon as the OPTION premium target is met (do not wait for the spot target)', 'bool'], ['reentryLock', 'After an exit, block the same-direction order on that symbol until the trend reverses', 'ssel', [['target', 'After profit exits (target / profit lock)'], ['both', 'After any exit (profit or stop-loss)'], ['off', 'Off']]], ['bookPct', 'Book profit at this % of target (any time market is open)', 'pct'], ['lockProfit', 'Trailing profit lock', 'bool'], ['lockAt', 'Lock arms once profit reaches (% of target)', 'pct'], ['lockKeep', 'Exit if profit falls back to (% of target)', 'pct']]],
     ['Strategy parameters (Settings sheet)', [['profitGoal', 'Profit goal per trade (₹) – workbook sizing', 'num'], ['vixThreshold', 'VIX threshold debit/credit', 'num'], ['targetPct', 'Underlying target (%)', 'pct'], ['slPct', 'Underlying stop-loss (%)', 'pct'],
       ['widthStock', 'Spread width – stocks (% of spot)', 'pct'], ['widthNifty', 'Spread width – Nifty (% of spot)', 'pct'], ['maxLots', 'Max lots per trade', 'num'], ['minEdge', 'Min agent edge (max 6)', 'num'], ['holdDays', 'Assumed days to reach target', 'num'], ['ivMult', 'Stock IV = VIX ×', 'num'], ['rf', 'Risk-free rate (%)', 'pct'], ['maxAge', 'Max data age counted as LIVE (sec)', 'num']]],
     ['Book rules (Settings sheet)', [['minOI', 'Min open interest per leg (contracts)', 'num'], ['minVol', 'Min avg daily volume (shares)', 'num'], ['maxBA', 'Max bid-ask spread (% of mid)', 'pct'], ['minYield', 'Min credit yield (credit / width)', 'pct'], ['minDTEBuy', 'Min days to expiry – BOUGHT options', 'num'],
@@ -414,7 +425,7 @@
     let h = `<div class="card"><h4>Data feed (prices, candles, option chain)</h4>${field(['mode', 'Feed provider', 'ssel', [['demo', 'Demo (offline synthetic)'], ['live', 'Live – Upstox API'], ['custom', 'Custom JSON feed (your own adapter)']]])}
       ${S.mode === 'live' ? `<label>Upstox Analytics token (read-only)<input type="password" id="tok" data-k="token" value="${esc(S.token)}" placeholder="Paste Analytics token" autocomplete="off"></label>` : ''}
       ${S.mode === 'custom' ? field(['feedUrl', 'Custom feed base URL', 'text']) + field(['feedHeaders', 'Custom feed headers (JSON)', 'text']) : ''}
-      ${S.mode === 'live' ? field(['lotSync', 'Use exchange lot sizes from Upstox (recommended)', 'bool']) : ''}
+      ${S.mode === 'live' ? field(['lotSource', 'Lot size source', 'ssel', [['book', 'Book / workbook list (strict)'], ['upstox', 'Exchange lot from Upstox']]]) + field(['lotSync', 'Compare book lots with exchange lots daily', 'bool']) + `<div class="btns"><button class="btn sm ghost" data-act="lotcheck">Check lot sizes now</button></div>` + (A.lotReport ? `<div class="sub">Checked ${A.lotReport.n} symbols at ${hhmm(A.lotReport.time)}: ${A.lotReport.diff.length ? A.lotReport.diff.length + ' differ from the book' : 'all match the book'}.${A.lotReport.diff.length ? '<br>' + A.lotReport.diff.map(esc).join('<br>') : ''}</div>` : '') : ''}
       <label>Refresh every (sec)<input type="number" data-k="refreshSec" value="${S.refreshSec}"></label>
       <div class="btns"><button class="btn sm" data-act="test">Test connection</button>${S.mode === 'live' ? '<button class="btn sm ghost" data-act="showtok">Show/hide</button>' : ''}</div><div class="sub" id="testres"></div></div>
       <div class="card"><h4>Order execution (separate from the feed)</h4>
@@ -501,6 +512,7 @@
     else if (a === 'ag') { A.ag = k; render(); } else if (a === 'df') { A.df = k; render(); } else if (a === 'more') { A.more = k; render(); }
     else if (a === 'tog') { A.open[k] = !A.open[k]; render(); }
     else if (a === 'hseg') { A.hseg = k; render(); }
+    else if (a === 'lotcheck') { await lotCheck(true); }
     else if (a === 'newsession') { if (confirm('Delete ALL old orders, trades and logs and start a fresh paper account?')) { QT.Paper.reset(S.capital); QT.Alerts.log = []; QT.Alerts.seen = {}; QT.Alerts.save(); QT.Run.clear(); A.tried = {}; toast('Fresh start: only new orders from now'); render(); } }
     else if (a === 'edu-ok') { S.eduAccepted = true; saveS(); nextModal(); }
     else if (a === 'modal-no') { nextModal(); }

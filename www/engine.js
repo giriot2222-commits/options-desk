@@ -3,7 +3,7 @@
   const QT = (globalThis.QT = globalThis.QT || {});
 
   QT.DEFAULTS = {
-    mode: 'demo', lotSync: true, token: '', feedUrl: '', feedHeaders: '{}', refreshSec: 60, expiryMode: 'auto', maxAge: 120,
+    mode: 'demo', lotSync: true, lotSource: 'book', strictBook: true, token: '', feedUrl: '', feedHeaders: '{}', refreshSec: 60, expiryMode: 'auto', maxAge: 120,
     strat: { 1: true, 2: true, 3: false, 4: false, 5: false, 6: false, 7: true, 8: true, 9: true, 10: true },
     neutralTrade: true, maExit: true, force: {}, spotOv: {},
     // Settings sheet
@@ -14,9 +14,9 @@
     // paper account
     capital: 1000000, autoTrade: true, minConviction: 50, maxOpen: 20, allowDup: false,
     // money management ("AI" sizing = risk-based lots within utilisation caps)
-    sizing: 'ai', riskPct: 0.015, marginPerTradePct: 0.1, maxUtilPct: 0.9, dailyLossPct: 0.03, maxTradesPerDay: 20,
+    sizing: 'workbook', riskPct: 0.015, marginPerTradePct: 0.1, maxUtilPct: 0.9, dailyLossPct: 0.03, maxTradesPerDay: 20,
     // profit booking (works any time the market is open, even outside the new-order window)
-    bookPct: 1, lockProfit: true, lockAt: 0.7, lockKeep: 0.4,
+    exitOnPremiumTarget: true, reentryLock: 'target', bookPct: 1, lockProfit: true, lockAt: 0.7, lockKeep: 0.4,
     // Agent 2 (history & movement) + Judge
     a2Enabled: true, a2Strict: 'normal', a2Weight: 0.4,
     // broker execution (separate from the data feed)
@@ -82,9 +82,12 @@
 
   // ---------- helpers ----------
   const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : NaN);
-  const tick = (x) => Math.max(0.05, Math.round(x * 20) / 20);
-  const r1 = (x) => Math.round(x * 10) / 10;
-  const r2 = (x) => Math.round(x * 100) / 100;
+  // Excel-exact ROUND (half away from zero on the decimal value) so every rupee matches the workbook
+  const xr = (x, d = 0) => { const k = Math.pow(10, d), s = x < 0 ? -1 : 1; return (s * Math.round(Math.abs(x) * k * (1 + 1e-12))) / k; };
+  QT.xr = xr;
+  const tick = (x) => Math.max(0.05, xr(x * 20, 0) / 20);
+  const r1 = (x) => xr(x, 1);
+  const r2 = (x) => xr(x, 2);
   const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   QT.ddmmm = (d) => d.slice(8, 10) + '-' + MON[+d.slice(5, 7) - 1];
   QT.istNow = () => new Date(Date.now() + 19800000);
@@ -116,10 +119,20 @@
   QT.candleId = (tf) => { const t = Date.now() + 19800000 - 5000, day = Math.floor(t / 864e5), mins = (t % 864e5) / 60000 - 555; return day * 1000 + Math.floor(mins / tf); };
   QT.nextCloseSecs = (tf) => { const t = Date.now() + 19800000, mins = (t % 864e5) / 60000 - 555, nxt = (Math.floor(mins / tf) + 1) * tf; return Math.max(0, Math.round((nxt - mins) * 60)); };
   QT.marketOpen = () => QT.isWeekday() && QT.istMin() >= 555 && QT.istMin() <= 930;
+  // double-precision normal CDF (Hart 1968 / West 2005) - same accuracy as Excel's NORMSDIST
   function ncdf(x) {
-    const t = 1 / (1 + 0.2316419 * Math.abs(x)), d = 0.3989423 * Math.exp((-x * x) / 2);
-    const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
-    return x > 0 ? 1 - p : p;
+    const ax = Math.abs(x); let c;
+    if (ax > 37) c = 0;
+    else {
+      const ex = Math.exp((-ax * ax) / 2);
+      if (ax < 7.07106781186547) {
+        let b = 3.52624965998911e-2 * ax + 0.700383064443688; b = b * ax + 6.37396220353165; b = b * ax + 33.912866078383; b = b * ax + 112.079291497871; b = b * ax + 221.213596169931; b = b * ax + 220.206867912376;
+        c = ex * b;
+        let d = 8.83883476483184e-2 * ax + 1.75566716318264; d = d * ax + 16.064177579207; d = d * ax + 86.7807322029461; d = d * ax + 296.564248779674; d = d * ax + 637.333633378831; d = d * ax + 793.826512519948; d = d * ax + 440.413735824752;
+        c = c / d;
+      } else { let b = ax + 0.65; b = ax + 4 / b; b = ax + 3 / b; b = ax + 2 / b; b = ax + 1 / b; c = ex / b / 2.506628274631; }
+    }
+    return x > 0 ? 1 - c : c;
   }
   QT.bs = function (type, S, K, T, r, v) {
     if (T <= 0 || v <= 0) return Math.max(0, type === 'CE' ? S - K : K - S);
@@ -212,13 +225,21 @@
     const { sym, spot, ind, vix, S, strat, expiry, today, lot, chain } = c;
     const st = QT.STRATS[strat], dte = QT.daysBetween(today, expiry);
     const iv = (vix / 100) * (sym === 'NIFTY' ? 1 : S.ivMult), T = Math.max(1, dte) / 365, T2 = Math.max(1, dte - S.holdDays) / 365;
-    const step = QT.strikeStep(sym, spot), atm = Math.round(spot / step) * step;
-    const cushion = Math.round((spot * iv * Math.sqrt(T)) / step) * step;
-    let W = Math.max(step, Math.round((spot * (sym === 'NIFTY' ? S.widthNifty : S.widthStock)) / step) * step);
+    // strikes: the real listed strikes when the option chain is known (ATM = listed strike nearest to spot); the workbook's step table otherwise
+    const grid = chain && chain.size > 6 ? [...chain.keys()].sort((x, y) => x - y) : null;
+    let step = QT.strikeStep(sym, spot), atm = xr(spot / step, 0) * step, snap = (k) => k;
+    if (grid) {
+      const nr = grid.filter((k) => Math.abs(k - spot) / spot < 0.1), gaps = nr.slice(1).map((k, i) => k - nr[i]).filter((g) => g > 0);
+      if (gaps.length) step = Math.min(...gaps);
+      snap = (k) => grid.reduce((b, g) => (Math.abs(g - k) < Math.abs(b - k) || (Math.abs(g - k) === Math.abs(b - k) && g > b) ? g : b), grid[0]);
+      atm = snap(spot);
+    }
+    const cushion = xr((spot * iv * Math.sqrt(T)) / step, 0) * step;
+    let W = Math.max(step, xr((spot * (sym === 'NIFTY' ? S.widthNifty : S.widthStock)) / step, 0) * step);
     if ([5, 6, 9].includes(strat)) W = Math.max(W, cushion);
 
     const legs = st.legs.map(([a, t, off]) => {
-      const K = atm + off * W, model = QT.bs(t, spot, K, T, S.rf, iv);
+      const K = snap(atm + off * W), model = QT.bs(t, spot, K, T, S.rf, iv);
       const q = chain && chain.get(K) && chain.get(K)[t];
       let p = model, src = 'MODEL', oi = null, ba = null, key = null;
       if (q) {
@@ -239,10 +260,10 @@
     const sSL = st.bias === 'U' ? spot * (1 - S.slPct) : st.bias === 'D' ? spot * (1 + S.slPct) : strat <= 8 ? spot : spot * (1 + S.targetPct);
     const profitPS = !debit ? r2(Math.max(0.05, Math.abs(net) * S.creditTP)) : r2(Math.max(0.05, netAt(sT, T2) - m0));
     const lossPS = !debit ? r2(Math.min(maxLossPS, Math.max(0.05, Math.abs(net)))) : r2(Math.min(maxLossPS, Math.max(0.05, m0 - netAt(sSL, T2))));
-    const exitTarget = Math.round(Math.abs(net + profitPS) * 20) / 20;
-    const exitSL = Math.round((net > 0 ? Math.max(0, net - lossPS) : Math.abs(net - lossPS)) * 20) / 20;
-    const lots = Math.min(S.maxLots, Math.max(1, Math.ceil(S.profitGoal / (lot * profitPS)))), qty = lots * lot;
-    const capital = Math.round(debit ? qty * net : qty * maxLossPS);
+    const exitTarget = xr(Math.abs(net + profitPS) * 20, 0) / 20;
+    const exitSL = xr((net > 0 ? Math.max(0, net - lossPS) : Math.abs(net - lossPS)) * 20, 0) / 20;
+    const lots = Math.min(S.maxLots, Math.max(1, Math.ceil(S.profitGoal / (lot * profitPS) - 1e-9))), qty = lots * lot;
+    const capital = xr(debit ? qty * net : qty * maxLossPS, 0);
 
     // expiry payoff scan (for max profit display)
     const Ks = legs.map((l) => l.K), pts = [0, ...Ks, Math.max(...Ks) * 2];
@@ -256,8 +277,9 @@
 
     // ---- 11 book-rule checks (Trade Planner CU..DE) ----
     const rules = [], add = (res, note) => rules.push({ res, note: note || '' });
+    const strict = !!S.strictBook, soft = strict ? 'FAIL' : 'WARN'; // strict book mode: no tolerance, every measurable rule is a hard FAIL
     let e1 = debit ? (dte >= S.minDTEBuy ? 'PASS' : 'FAIL') : dte <= S.maxDTESell ? 'PASS' : 'FAIL';
-    if (e1 === 'FAIL' && !auto) e1 = 'WARN';
+    if (e1 === 'FAIL' && !auto && !strict) e1 = 'WARN';
     add(e1, debit ? `${dte}d vs min ${S.minDTEBuy}` : `${dte}d vs max ${S.maxDTESell}`);
     if (strat <= 4) {
       const be = strat === 1 || strat === 3 ? legs[0].K + net : legs[0].K - net;
@@ -275,19 +297,19 @@
       add(ok ? 'PASS' : 'FAIL', `~20-DMA ${r1(ind.ma20)}`);
     } else add('n/a');
     const oiV = legs.filter((l) => l.oi != null).map((l) => l.oi);
-    if (oiV.length < legs.length) add('WARN', 'open interest not verified (MODEL prices)');
+    if (oiV.length < legs.length) add(soft, 'open interest not verified (MODEL prices)');
     else add(Math.min(...oiV) >= S.minOI ? 'PASS' : 'FAIL', `min OI ${Math.round(Math.min(...oiV))} contracts`);
     const baV = legs.filter((l) => l.ba != null).map((l) => l.ba);
-    if (!baV.length) add('n/a'); else add(Math.max(...baV) > S.maxBA ? 'WARN' : 'PASS', `max bid-ask ${(Math.max(...baV) * 100).toFixed(1)}%`);
-    if (sym === 'NIFTY' || !ind.avgVol) add('n/a'); else add(ind.avgVol >= S.minVol ? 'PASS' : 'WARN', `avg volume ${Math.round(ind.avgVol).toLocaleString('en-IN')}`);
+    if (!baV.length) add('n/a'); else add(Math.max(...baV) > S.maxBA ? soft : 'PASS', `max bid-ask ${(Math.max(...baV) * 100).toFixed(1)}%`);
+    if (sym === 'NIFTY' || !ind.avgVol) add('n/a'); else add(ind.avgVol >= S.minVol ? 'PASS' : soft, `avg volume ${Math.round(ind.avgVol).toLocaleString('en-IN')}`);
     if (strat === 7 || strat === 8) { const lb = dte < 75 ? 40 : dte < 105 ? 60 : 80, rg = ind['hi' + lb] - ind['lo' + lb]; add(net < 0.5 * rg ? 'PASS' : 'FAIL', `cost ${net} vs half of ${lb}-day range ${r1(0.5 * rg)}`); } else add('n/a');
     add(strat === 7 || strat === 8 ? 'WARN' : 'n/a', strat === 7 || strat === 8 ? 'confirm results/news within ~2 weeks' : '');
     add(profitPS / lossPS >= 1 ? 'PASS' : 'WARN', `reward ${profitPS} vs risk ${lossPS}`);
     // book stock-selection conditions the workbook could only describe: trend + clear support/resistance, and consolidation (flag/pennant) for straddles
-    if (st.bias === 'U') add(spot > ind.ma20 && ind.ma20 >= ind.ma50 ? 'PASS' : 'WARN', `spot ${r1(spot)} vs 20-DMA ${r1(ind.ma20)} / 50-DMA ${r1(ind.ma50)} (support below)`);
-    else if (st.bias === 'D') add(spot < ind.ma20 && ind.ma20 <= ind.ma50 ? 'PASS' : 'WARN', `spot ${r1(spot)} vs 20-DMA ${r1(ind.ma20)} / 50-DMA ${r1(ind.ma50)} (resistance above)`);
+    if (st.bias === 'U') add(spot > ind.ma20 && ind.ma20 >= ind.ma50 ? 'PASS' : soft, `spot ${r1(spot)} vs 20-DMA ${r1(ind.ma20)} / 50-DMA ${r1(ind.ma50)} (support below)`);
+    else if (st.bias === 'D') add(spot < ind.ma20 && ind.ma20 <= ind.ma50 ? 'PASS' : soft, `spot ${r1(spot)} vs 20-DMA ${r1(ind.ma20)} / 50-DMA ${r1(ind.ma50)} (resistance above)`);
     else add('n/a');
-    if (strat === 7 || strat === 8) add(ind.atrRatio < 0.85 || ind.rangeRatio < 0.6 ? 'PASS' : 'WARN', `ATR5/ATR20 ${ind.atrRatio.toFixed(2)}, 10d/40d range ${ind.rangeRatio.toFixed(2)}`); else add('n/a');
+    if (strat === 7 || strat === 8) add(ind.atrRatio < 0.85 || ind.rangeRatio < 0.6 ? 'PASS' : soft, `ATR5/ATR20 ${ind.atrRatio.toFixed(2)}, 10d/40d range ${ind.rangeRatio.toFixed(2)}`); else add('n/a');
     const fails = rules.map((r, i) => (r.res === 'FAIL' ? 'FAIL: ' + RULE_NAMES[i] + '; ' : '')).join('');
     const warns = rules.map((r, i) => (r.res === 'WARN' ? 'WARN: ' + RULE_NAMES[i] + '; ' : '')).join('');
     const gate = fails ? 'FAIL' : warns ? 'PASS (warnings)' : 'PASS';
@@ -306,7 +328,7 @@
 
     return {
       sym, spot, strat, stratName: st.name, view: st.view, bias: st.bias, expiry, dte, lot, lots, qty, net, debit, step, W, legs, ticket,
-      maxLoss: r2(maxLossPS), maxProfit, tpPnl: profitPS, slPnl: -lossPS, profitAtTarget: Math.round(profitPS * qty), lossAtSL: Math.round(lossPS * qty),
+      maxLoss: r2(maxLossPS), maxProfit, tpPnl: profitPS, slPnl: -lossPS, profitAtTarget: xr(profitPS * qty, 0), lossAtSL: xr(lossPS * qty, 0), maxLossRs: xr(maxLossPS * qty, 0),
       exitTarget, exitSL, capital, margin: capital, buyArea, targetTxt, slTxt, plan, targetSpot: st.bias === 'N' ? null : r2(sT), slSpot: st.bias === 'N' ? null : r2(sSL), range,
       exitBy, src: legs.every((l) => l.src === 'LIVE') ? 'LIVE option prices' : 'MODEL prices - verify', rules, gate, details, fails: fails ? fails.split('; ').filter(Boolean) : [], warns: warns ? warns.split('; ').filter(Boolean) : [], pass: !fails,
     };

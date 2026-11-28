@@ -7,9 +7,9 @@
 
   const P = (QT.Paper = {
     st: { seq: 0, oseq: 0, realized: 0, trades: [], orders: [], curve: [], capital: null },
-    load() { try { const j = JSON.parse(LS().getItem('qt_paper2')); if (j) P.st = { ...P.st, ...j }; } catch (e) {} },
+    load() { try { const j = JSON.parse(LS().getItem('qt_paper2')); if (j) P.st = { ...P.st, ...j }; } catch (e) {} P.st.locks = P.st.locks || {}; },
     save() { try { LS().setItem('qt_paper2', JSON.stringify(P.st)); } catch (e) {} },
-    reset(cap) { P.st = { seq: 0, oseq: 0, realized: 0, trades: [], orders: [], curve: [], capital: cap }; P.save(); },
+    reset(cap) { P.st = { seq: 0, oseq: 0, realized: 0, trades: [], orders: [], curve: [], capital: cap, locks: {} }; P.save(); },
     open() { return P.st.trades.filter((t) => t.status === 'OPEN'); },
     closed() { return P.st.trades.filter((t) => t.status !== 'OPEN'); },
 
@@ -38,8 +38,9 @@
       const lossPerLot = Math.max(0.05, Math.abs(row.slPnl)) * lot, marginPerLot = Math.max(1, (row.debit ? row.net : row.maxLoss) * lot);
       const room = Math.min(eq * S.marginPerTradePct, eq * S.maxUtilPct - P.margin(), P.available(S));
       const byMargin = Math.floor(room / marginPerLot), budget = eq * S.riskPct * (0.5 + (row.conviction || 50) / 100), byRisk = Math.floor(budget / lossPerLot);
-      const lots = S.sizing === 'workbook' ? Math.max(0, Math.min(row.lots, byMargin)) : Math.max(0, Math.min(byRisk, byMargin, S.maxLots));
-      return { lots, byRisk, byMargin, wb: row.lots, budget: Math.round(budget), lossPerLot: Math.round(lossPerLot), mode: S.sizing };
+      const exact = S.strictBook || S.sizing === 'workbook'; // book sizing: lots = ROUNDUP(profit goal / (lot x profit per share)); never resized
+      const lots = exact ? (byMargin >= row.lots ? row.lots : 0) : Math.max(0, Math.min(byRisk, byMargin, S.maxLots));
+      return { lots, byRisk, byMargin, wb: row.lots, budget: Math.round(budget), lossPerLot: Math.round(lossPerLot), mode: exact ? 'workbook' : 'ai', need: Math.round(marginPerLot * row.lots) };
     },
     sizeLots(row, S) { return P.sizeInfo(row, S).lots; },
 
@@ -51,18 +52,21 @@
         legs: row.legs.map((l) => ({ a: l.a, t: l.t, K: l.K, px: l.p })) };
       const reject = (reason) => { P.logOrder({ ...base, status: 'REJECTED', reason }); P.save(); return { ok: false, msg: reason }; };
       if (!QT.canTrade(S, src)) return reject(QT.isWeekday() && !QT.dayAllowed(S) ? `${QT.dayName(QT.istNow().getUTCDay())} is not enabled for new orders (Settings > Trading days)` : `Outside trading time ${S.tradeStart}-${S.tradeEnd} IST`);
-      if (!S.allowDup && P.open().some((t) => t.sym === row.sym)) return reject('Position already open in ' + row.sym);
+      if (P.open().some((t) => t.sym === row.sym)) return reject('One symbol - one order: a position is already open in ' + row.sym);
+      const lk = P.lockedFor(row, S);
+      if (lk) return reject(`Re-entry locked: ${row.sym} already hit ${lk.why} (${lk.since.slice(0, 16).replace('T', ' ')}). Same-direction order waits until the trend reverses`);
+      if ((P.st.locks || {})[row.sym] && S.reentryLock !== 'off') delete P.st.locks[row.sym]; // opposite-direction signal = reversal
       if (P.open().length >= S.maxOpen) return reject('Max open positions (' + S.maxOpen + ') reached');
-      const eq = P.equity(S), day = QT.istDate();
-      if (P.st.trades.filter((t) => t.entryDay === day).length >= S.maxTradesPerDay) return reject('Max trades per day (' + S.maxTradesPerDay + ') reached');
-      if (P.todayRealized() <= -eq * S.dailyLossPct) return reject(`Daily loss limit (${(S.dailyLossPct * 100).toFixed(1)}% of capital) reached - no new orders today`);
-      const sz = P.sizeInfo(row, S), lots = sz.lots;
-      if (lots < 1) return reject(`Capital limits: no room for 1 lot (free margin ${Math.round(P.available(S))}, utilisation cap ${(S.maxUtilPct * 100).toFixed(0)}%, per-trade cap ${(S.marginPerTradePct * 100).toFixed(0)}%, risk ${(S.riskPct * 100).toFixed(1)}%)`);
-      const qty = lots * row.lot; base.lots = lots; base.qty = qty;
       if (S.quoteGuard && row.legs.every((l) => l.src === 'LIVE')) {
         const bad = row.legs.find((l) => Math.abs(l.p - l.model) > 0.6 * Math.max(l.model, 1));
         if (bad) return reject(`Quote check: ${bad.t} ${bad.K} price ${bad.p} is far from fair value ${bad.model.toFixed(2)} (stale or empty order book) - order not placed`);
       }
+      const eq = P.equity(S), day = QT.istDate();
+      if (P.st.trades.filter((t) => t.entryDay === day).length >= S.maxTradesPerDay) return reject('Max trades per day (' + S.maxTradesPerDay + ') reached');
+      if (P.todayRealized() <= -eq * S.dailyLossPct) return reject(`Daily loss limit (${(S.dailyLossPct * 100).toFixed(1)}% of capital) reached - no new orders today`);
+      const sz = P.sizeInfo(row, S), lots = sz.lots;
+      if (lots < 1) return reject(sz.mode === 'workbook' ? `Capital limits: the book lots (${sz.wb}) need margin ${sz.need} but only ${Math.round(Math.min(eq * S.marginPerTradePct, eq * S.maxUtilPct - P.margin(), P.available(S)))} is allowed (free ${Math.round(P.available(S))}) - lots are never reduced` : `Capital limits: no room for 1 lot (free margin ${Math.round(P.available(S))}, utilisation cap ${(S.maxUtilPct * 100).toFixed(0)}%, per-trade cap ${(S.marginPerTradePct * 100).toFixed(0)}%, risk ${(S.riskPct * 100).toFixed(1)}%)`);
+      const qty = lots * row.lot; base.lots = lots; base.qty = qty;
       const slip = S.slipPct;
       const legs = row.legs.map((l) => ({ a: l.a, t: l.t, K: l.K, key: l.key, fill: r2(l.a === 'B' ? l.p * (1 + slip) : l.p * (1 - slip)) }));
       const net = r2(legs.reduce((x, l) => x + (l.a === 'B' ? l.fill : -l.fill), 0));
@@ -100,6 +104,28 @@
       const m = P.markPx(q), half = q.bid > 0 && q.ask > 0 ? (q.ask - q.bid) / 2 : 0, cap = m * (S.maxBA / 2), h = Math.min(half, cap);
       return Math.max(0.05, side === 'B' ? m - h : m + h);
     },
+    // value from live two-sided quotes only (bid and ask present, spread <= 25%): a real market exists, so a target met here is a real exit
+    valueTwoSided(t, chain) {
+      let v = 0;
+      for (const l of t.legs) {
+        const q = chain && chain.get(l.K) && chain.get(l.K)[l.t];
+        if (!q || !(q.bid > 0) || !(q.ask > 0) || (q.ask - q.bid) / ((q.ask + q.bid) / 2) > 0.25) return null;
+        const m = (q.bid + q.ask) / 2; v += l.a === 'B' ? m : -m;
+      }
+      return v;
+    },
+    // re-entry lock: after a profit exit the same-direction order for that symbol waits until the trend reverses
+    lockedFor(row, S) { const lk = (P.st.locks || {})[row.sym]; return S.reentryLock !== 'off' && lk && row.bias === lk.dir ? lk : null; },
+    releaseLocks(all) {
+      const out = [];
+      for (const [sym, lk] of Object.entries(P.st.locks || {})) {
+        const r = all[sym]; if (!r || !r.ag) continue; const ts = r.ag.ts;
+        const rev = lk.dir === 'U' ? ts <= -1 : lk.dir === 'D' ? ts >= 1 : Math.abs(ts) >= 1;
+        if (rev) { delete P.st.locks[sym]; out.push(sym); }
+      }
+      if (out.length) P.save();
+      return out;
+    },
     value(t, chain) {
       let v = 0;
       for (const l of t.legs) {
@@ -134,11 +160,17 @@
         if (v != null) { t.val = r2(v); t.pnlGross = r2((v - t.net) * t.qty); }
         const sp = S.closeExit && sig && sig[t.sym] ? sig[t.sym] : t.curSpot;
         const pps = t.val - t.net, ok = v != null && !t.est;
-        let why = null, premium = false;
-        if (ok) {
+        let why = null, premium = false, viaTS = false;
+        // premium TARGET: exit as soon as the option target is met on live two-sided quotes - never wait for the spot target
+        if (S.exitOnPremiumTarget !== false) {
+          const vt = P.valueTwoSided(t, ch);
+          if (vt != null && vt - t.net >= t.tpPnl * (S.bookPct || 1) && settled) { why = 'TARGET HIT'; viaTS = true; if (v == null || t.est) { v = vt; t.val = r2(vt); t.pnlGross = r2((vt - t.net) * t.qty); t.est = false; } }
+        }
+        if (!why && ok) {
           t.peak = Math.max(t.peak || 0, pps);
-          if (pps >= t.tpPnl * (S.bookPct || 1)) { why = 'TARGET HIT'; premium = true; } // profit is booked any time the market is open
-          else if (pps <= t.slPnl) { why = 'SL HIT'; premium = true; }
+          if (S.exitOnPremiumTarget === false) { /* wait for the spot target only */ }
+          else if (pps >= t.tpPnl * (S.bookPct || 1)) { why = 'TARGET HIT'; premium = true; } // profit is booked any time the market is open
+          if (why) { /* target already found */ } else if (pps <= t.slPnl) { why = 'SL HIT'; premium = true; }
           else if (S.lockProfit && t.peak >= t.tpPnl * S.lockAt && pps <= t.tpPnl * S.lockKeep) { why = 'PROFIT LOCK'; premium = true; }
         }
         if (!why && t.targetSpot) {
@@ -161,7 +193,7 @@
         // premium-based exits: not in the opening-settle minutes, and must repeat on N consecutive marks (filters bad ticks)
         if (why && premium) { t.hit = (t.hitWhy === why ? (t.hit || 0) : 0) + 1; t.hitWhy = why; if (!settled || t.hit < (S.exitConfirm || 1)) why = null; }
         else if (!why || !premium) { if (!premium) { t.hit = 0; t.hitWhy = null; } }
-        if (why && ok && canExit) { P.close(t, why, S, ch); out.push(t); }
+        if (why && v != null && (ok || viaTS) && canExit) { P.close(t, why, S, ch); out.push(t); }
       }
       P.st.curve.push([Date.now(), P.equity(S)]); if (P.st.curve.length > 600) P.st.curve.shift();
       P.save();
@@ -182,7 +214,9 @@
       t.status = why; t.exitTime = new Date().toISOString(); t.exitSpot = t.curSpot;
       P.logOrder({ sym: t.sym, stratName: t.stratName, src: why === 'MANUAL' ? 'manual' : 'auto-exit', lots: t.lots, qty: t.qty, expiry: t.expiry, signal: 'EXIT', status: 'COMPLETE', reason: why, tradeId: t.id,
         legs: t.legs.map((l) => ({ a: l.a === 'B' ? 'S' : 'B', t: l.t, K: l.K, px: l.exitPx })), fillNet: r2(-exitVal) });
-      P.st.realized = r2(P.st.realized + t.pnl); P.save();
+      P.st.realized = r2(P.st.realized + t.pnl);
+      if (S.reentryLock !== 'off' && (['TARGET HIT', 'PROFIT LOCK'].includes(why) || (S.reentryLock === 'both' && why !== 'MANUAL'))) (P.st.locks = P.st.locks || {})[t.sym] = { dir: t.bias, since: new Date().toISOString(), why, tid: t.id, strat: t.strat };
+      P.save();
       if (P.onClose) P.onClose(t);
     },
 

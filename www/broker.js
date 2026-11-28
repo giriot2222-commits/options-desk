@@ -33,6 +33,8 @@
       if (S.orderBroker === 'custom' && !S.webhookUrl.trim()) return 'Custom order webhook URL missing';
       if (kind === 'entry' && !QT.canTrade(S, src === 'manual' ? 'manual' : 'auto')) return `Outside trading time ${S.tradeStart}-${S.tradeEnd} IST`;
       if (kind === 'exit' && !QT.marketOpen()) return 'Market is closed - exit orders wait for the next session';
+      const U = QT.UNIVERSE[t.sym];
+      if (U && U.exch && U.exch !== t.lot) return `Lot size differs: book ${t.lot} vs exchange ${U.exch}. Set Lot source to Upstox (Settings) before real orders`;
       const L = B.legs(t, kind);
       if (L.some((l) => !l.key || String(l.key).startsWith('DEMO'))) return 'A leg has no real instrument key (model price) - cannot place';
       if (L.some((l) => l.price * t.qty > S.maxOrderValue)) return `An order exceeds the max order value ${S.maxOrderValue}`;
